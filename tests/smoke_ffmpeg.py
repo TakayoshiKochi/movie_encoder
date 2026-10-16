@@ -69,6 +69,39 @@ def main():
                                   "sar": video["sample_aspect_ratio"], "audio_tracks": len(audios),
                                   "duration": info["format"]["duration"], "full_decode": "passed",
                                   "resume": "passed"})
+    # Damage only a copy: preserve TS/PES headers and timestamps, corrupt three
+    # video payload packets halfway through the clip to exercise error concealment.
+    damaged = bytearray(source.read_bytes())
+    video_pid = int(input_video["id"], 0)
+    changed = 0
+    for offset in range((len(damaged) // 376) * 188, len(damaged) - 187, 188):
+        packet = damaged[offset:offset + 188]
+        pid = ((packet[1] & 0x1f) << 8) | packet[2]
+        control = (packet[3] >> 4) & 3
+        if pid != video_pid or packet[1] & 0x40 or control not in (1, 3):
+            continue
+        payload = 4 if control == 1 else 5 + packet[4]
+        if payload >= 188:
+            continue
+        damaged[offset + payload:offset + 188] = b"\x55" * (188 - payload)
+        changed += 1
+        if changed == 3:
+            break
+    assert changed == 3, "not enough video packets to damage"
+    damaged_source = root / "damaged.ts"
+    damaged_source.write_bytes(damaged)
+    base = ["encode", str(damaged_source), "--ffmpeg", ffmpeg, "--ffprobe", ffprobe, "--verify-full"]
+    strict_dir = root / "damaged-strict"
+    assert encode.main(base + ["--output-dir", str(strict_dir)]) == 1, "strict mode accepted damaged input"
+    assert not (strict_dir / "damaged.ts.mp4").exists()
+    recovered_dir = root / "damaged-recovered"
+    assert encode.main(base + ["--output-dir", str(recovered_dir), "--allow-input-errors"]) == 0
+    recovered = recovered_dir / "damaged.ts.mp4"
+    encode.validate_output(encode.probe(ffprobe, recovered), 2, 6, "hevc")
+    assert encode.read_json(recovered.with_suffix(".mp4.json"))["request"]["allow_input_errors"] is True
+    report["damaged_input"] = {"damaged_video_packets": changed, "strict": "rejected",
+                               "allow_input_errors": "passed", "full_decode": "passed",
+                               "recovered_file": str(recovered)}
     encode.write_json(root / "report.json", report)
     print(json.dumps(report, ensure_ascii=False, indent=2))
 

@@ -26,7 +26,8 @@ class EncodingTests(unittest.TestCase):
         self.source = self.root / "日本語 & space.ts"
         self.source.write_bytes(b"original TS")
         self.target = self.root / "output" / "test.ts.mp4"
-        self.args = argparse.Namespace(program=None, start=0, duration=None, verify_full=False, dry_run=False)
+        self.args = argparse.Namespace(program=None, start=0, duration=None, verify_full=False, dry_run=False,
+                                       allow_input_errors=False)
 
     def run_job(self, probe=None, run=None):
         with patch("encode.probe", side_effect=probe or [INFO, OUTPUT]), \
@@ -190,6 +191,51 @@ class EncodingTests(unittest.TestCase):
             self.fake_ffmpeg(cmd, **kwargs)
         with self.assertRaises(encode.subprocess.CalledProcessError):
             self.run_job(run=run)
+        self.assertFalse(self.target.exists())
+
+    def test_input_error_recovery_is_opt_in_and_recorded(self):
+        self.args.allow_input_errors = True
+        self.run_job()
+        record = encode.read_json(self.target.with_suffix(".mp4.json"))
+        self.assertTrue(record["request"]["allow_input_errors"])
+        self.assertNotIn("-xerror", record["command"])
+        self.assertNotIn("-err_detect", record["command"])
+        self.assertNotIn("-fflags", record["command"])
+        self.args.allow_input_errors = False
+        with self.assertRaisesRegex(ValueError, "no matching job record"):
+            self.run_job(probe=[INFO])
+
+    def test_input_recovery_keeps_output_verification_strict(self):
+        self.args.allow_input_errors = True
+        self.args.verify_full = True
+        calls = []
+        def run(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[-1] == "-":
+                self.assertIn("-xerror", cmd)
+                raise encode.subprocess.CalledProcessError(1, cmd)
+            self.assertNotIn("-xerror", cmd)
+            self.fake_ffmpeg(cmd, **kwargs)
+        with self.assertRaises(encode.subprocess.CalledProcessError):
+            self.run_job(run=run)
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(self.target.exists())
+
+    def test_input_recovery_does_not_accept_truncated_output(self):
+        self.args.allow_input_errors = True
+        truncated = copy.deepcopy(OUTPUT)
+        truncated["format"]["duration"] = "1"
+        with self.assertRaisesRegex(ValueError, "Duration mismatch"):
+            self.run_job(probe=[INFO, truncated])
+        self.assertFalse(self.target.exists())
+
+    def test_input_recovery_still_rejects_fatal_encode_failure(self):
+        self.args.allow_input_errors = True
+        def fail(cmd, **kwargs):
+            self.fake_ffmpeg(cmd, **kwargs)
+            raise encode.subprocess.CalledProcessError(1, cmd)
+        with self.assertRaises(encode.subprocess.CalledProcessError):
+            self.run_job(probe=[INFO], run=fail)
         self.assertFalse(self.target.exists())
 
     def test_publish_does_not_clobber(self):

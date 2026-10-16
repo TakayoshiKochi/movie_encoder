@@ -8,7 +8,8 @@ param(
     [int]$MinAge = 300,
     [int]$ProgramId = -1,
     [switch]$DryRun,
-    [switch]$VerifyFull
+    [switch]$VerifyFull,
+    [switch]$AllowInputErrors
 )
 $ErrorActionPreference = 'Stop'
 if ($MinAge -lt 0) { throw 'MinAge must be nonnegative.' }
@@ -24,5 +25,6 @@ $cliArgs += @((Join-Path $PSScriptRoot 'encode.py'), 'encode', $InputDirectory,
 if ($ProgramId -ge 0) { $cliArgs += @('--program', "$ProgramId") }
 if ($DryRun) { $cliArgs += '--dry-run' }
 if ($VerifyFull) { $cliArgs += '--verify-full' }
+if ($AllowInputErrors) { $cliArgs += '--allow-input-errors' }
 & $runner.Source @cliArgs
 exit $LASTEXITCODE

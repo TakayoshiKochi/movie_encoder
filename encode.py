@@ -115,9 +115,12 @@ def load_profile(path, name, crf=None):
     return cfg
 
 
-def command(ffmpeg, source, target, cfg, video, audios, start=0, duration=None):
-    args = [ffmpeg, "-hide_banner", "-nostdin", "-n", "-loglevel", "info", "-xerror",
-            "-probesize", "100M", "-analyzeduration", "100M"]
+def command(ffmpeg, source, target, cfg, video, audios, start=0, duration=None,
+            allow_input_errors=False):
+    args = [ffmpeg, "-hide_banner", "-nostdin", "-n", "-loglevel", "info"]
+    if not allow_input_errors:
+        args += ["-xerror"]
+    args += ["-probesize", "100M", "-analyzeduration", "100M"]
     # Output-side seeking is slower but avoids relying on TS seek accuracy for comparisons.
     args += ["-i", str(source)]
     if start:
@@ -238,6 +241,9 @@ def encode_one(source, target, args, cfg, ffmpeg, ffprobe):
     output_duration = expected_duration(info, video, args.start, args.duration)
     request = {"source": before, "profile": cfg, "program": args.program,
                "start": args.start, "duration": args.duration, "verify_full": args.verify_full}
+    # Omit the default flag so completed jobs from earlier versions still match.
+    if args.allow_input_errors:
+        request["allow_input_errors"] = True
     sidecar = target.with_suffix(".mp4.json")
     if target.exists():
         if not sidecar.exists() or read_json(sidecar).get("request") != request:
@@ -246,24 +252,36 @@ def encode_one(source, target, args, cfg, ffmpeg, ffprobe):
         print(f"SKIP {target}", flush=True)
         return "skipped"
     partial = target.with_name(f".{target.stem}.{uuid.uuid4().hex}.partial.mp4")
-    cmd = command(ffmpeg, source, partial, cfg, video, audios, args.start, args.duration)
+    cmd = command(ffmpeg, source, partial, cfg, video, audios, args.start, args.duration,
+                  allow_input_errors=args.allow_input_errors)
+    if args.allow_input_errors:
+        print("WARNING: Input error recovery enabled; inspect the log and picture/audio near damaged sections.",
+              file=sys.stderr, flush=True)
     print(subprocess.list2cmdline(cmd), flush=True)
     if args.dry_run:
         return "planned"
     target.parent.mkdir(parents=True, exist_ok=True)
     log = target.with_name(target.name + f".{uuid.uuid4().hex[:8]}.log")
     started = time.monotonic()
+    stage = "encode input"
     try:
         with log.open("w", encoding="utf-8") as handle:
-            handle.write(subprocess.list2cmdline(cmd) + "\n")
+            handle.write(f"STAGE: {stage}\n" + subprocess.list2cmdline(cmd) + "\n")
             handle.flush()
             subprocess.run(cmd, stdout=handle, stderr=subprocess.STDOUT, check=True)
+            stage = "probe and validate output"
+            handle.write(f"\nSTAGE: {stage}\n")
+            handle.flush()
             output = probe(ffprobe, partial)
             validate_output(output, len(audios), output_duration, output_codec, cfg["pix_fmt"])
             if args.verify_full:
+                stage = "verify-full (decode output MP4)"
+                handle.write(f"\nSTAGE: {stage}\n")
+                handle.flush()
                 subprocess.run([ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-xerror",
                                 "-i", str(partial), "-map", "0:v", "-map", "0:a?",
                                 "-f", "null", "-"], stdout=handle, stderr=subprocess.STDOUT, check=True)
+        stage = "check source and publish output"
         if fingerprint(source) != before:
             raise ValueError("Source changed during encoding; output will not be published")
         record = {"request": request, "command": cmd, "output_probe": output,
@@ -275,7 +293,7 @@ def encode_one(source, target, args, cfg, ffmpeg, ffprobe):
         print(f"DONE {target} ({record['elapsed_seconds']}s)", flush=True)
         return "encoded"
     except BaseException:
-        print(f"Job failed. Log: {log}", file=sys.stderr, flush=True)
+        print(f"Job failed during {stage}. Log: {log}", file=sys.stderr, flush=True)
         raise
     finally:
         partial.unlink(missing_ok=True)
@@ -306,6 +324,8 @@ def main(argv=None):
     parser.add_argument("--duration", type=finite_nonnegative)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--verify-full", action="store_true")
+    parser.add_argument("--allow-input-errors", action="store_true",
+                        help="allow FFmpeg's normal input error recovery; output validation remains strict")
     args = parser.parse_args(argv)
     if args.duration == 0:
         parser.error("--duration must be greater than zero")

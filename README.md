@@ -124,7 +124,23 @@ py -3 .\encode.py encode 'D:\Recordings\Completed' --output-dir 'D:\Encoded' --r
 
 `--verify-full` は生成した MP4 の全映像・音声をデコードして検査するため、追加の処理時間が必要です。未指定時は構造と時間の検査のみです。再生時間は取得できた入力映像長（取得不可なら単一サービスのファイル長）と比較し、3 秒または 1% を超える差を拒否します。元 TS の時間情報が不正な場合は、ログを調べて個別対応してください。これらの検査は音ズレや主観画質の保証ではありません。
 
-FFmpeg の `-xerror` を使い、エラーを検出したときは処理を失敗させます。TS のドロップを無条件に無視するオプションや、自動的な音声時刻補正は加えていません。
+既定では、変換時に FFmpeg の `-xerror` を使い、エラーを検出したときは処理を失敗させます。`--verify-full` の有無に関係なく入力TSのデコードエラーで停止します。ログには `STAGE: encode input`、`STAGE: probe and validate output`、`STAGE: verify-full (decode output MP4)` を記録し、失敗時も段階を表示します。
+
+### TS の破損を補完して続行したい場合
+
+ログに `mpeg2video` の `ac-tex damaged` / `corrupt decoded frame` が出ている場合、入力の MPEG-2 映像の破損が疑われます。受信ドロップやファイル破損などが考えられますが、ログだけで原因までは断定できません。HEVCに変換済みの出力MP4の検査であれば、デコーダーは `mpeg2video` にはなりません。
+
+破損箇所を含む出力を許容して変換を試す場合だけ `--allow-input-errors` を指定します。
+
+```powershell
+py -3 .\encode.py encode 'D:\Recordings\番組.ts' --output-dir 'D:\Encoded-Recovered' --allow-input-errors --verify-full
+```
+
+このオプションは**入力を変換するプロセスの `-xerror` のみ外し、FFmpegの通常のエラー補完・続行を許可**します。破損パケットを強制的に捨てる `discardcorrupt` や、追加の `ignore_err`、自動音声時刻補正は指定しません。FFmpeg が致命的エラーで終了した場合、出力の再生時間・構造検査に失敗した場合、入力が変化した場合は、引き続き完成品にしません。
+
+**`--verify-full` はこの場合も `-xerror` で厳格に出力MP4を検査します。** ただし、入力の欠損がブロックノイズやフリーズとして正常なHEVC映像に変換されれば、デコード検査は通り得ます。補完は失われた映像を復元するものではありません。ログの破損箇所の前後で画質・音ズレを確認してください。
+
+オプションの使用は警告表示と `.mp4.json` の `request.allow_input_errors` に記録します。厳格モードで作った出力と区別するため、設定が違う既存出力は上書き・スキップしません。定期実行用スクリプトでは `-AllowInputErrors` が対応します。
 
 ## 定期実行
 
@@ -152,7 +168,7 @@ py -3 -m unittest discover -s tests -v
 
 テストでは外部プロセスをモックし、サービス選択、音声マッピング、上書き防止、入力更新・変換失敗・検査失敗時の扱い、再開、サンプル時間、一括処理を検証します。実際の FFmpeg と放送 TS での画質・同期検証は別途必要です。
 
-実際の FFmpeg を使う動作確認もできます。6秒の人工インターレース MPEG-2 TS（720×480、約29.97fps、SAR 8:9、音声2トラック）を生成し、HEVCのframe/bob、H.264のbobを変換します。全体デコード、フレームレート、ピクセル形式、アスペクト比、音声・言語タグ、完成品の再実行時スキップを検査します。生成物と `report.json` は `samples/smoke-*` に保存します。
+実際の FFmpeg を使う動作確認もできます。6秒の人工インターレース MPEG-2 TS（720×480、約29.97fps、SAR 8:9、音声2トラック）を生成し、HEVCのframe/bob、H.264のbobを変換します。全体デコード、フレームレート、ピクセル形式、アスペクト比、音声・言語タグ、完成品の再実行時スキップを検査します。さらに人工素材のコピーの映像ペイロード3パケットを破損させ、厳格モードの停止と、`--allow-input-errors --verify-full` での変換・出力検査の成功を確認します。生成物と `report.json` は `samples/smoke-*` に保存します。
 
 ```powershell
 py -3 .\tests\smoke_ffmpeg.py --ffmpeg 'C:\ProgramData\chocolatey\bin\ffmpeg.exe' --ffprobe 'C:\ProgramData\chocolatey\bin\ffprobe.exe'
