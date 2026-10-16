@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
@@ -12,11 +13,96 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
 ROOT = Path(__file__).resolve().parent
 EXTENSIONS = {".ts", ".m2ts", ".mts"}
+PRINT_LOCK = threading.Lock()
+
+
+def status(message, *, file=None):
+    with PRINT_LOCK:
+        print(message, file=file or sys.stdout, flush=True)
+
+
+class ProcessSupervisor:
+    """Track this batch's FFmpeg/ffprobe children, including during cancellation."""
+
+    def __init__(self):
+        self.cancelled = threading.Event()
+        self.lock = threading.Lock()
+        self.active = set()
+
+    def check_cancelled(self):
+        if self.cancelled.is_set():
+            raise InterruptedError("Batch cancelled")
+
+    def run(self, cmd, *, check=False, capture_output=False, **kwargs):
+        if capture_output:
+            kwargs.update(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # Cancellation cannot miss a process between checking and registering it.
+        with self.lock:
+            self.check_cancelled()
+            child = subprocess.Popen(cmd, **kwargs)
+            self.active.add(child)
+        try:
+            stdout, stderr = child.communicate()
+            self.check_cancelled()
+            result = subprocess.CompletedProcess(cmd, child.returncode, stdout, stderr)
+            if check:
+                result.check_returncode()
+            return result
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.communicate()
+            with self.lock:
+                self.active.discard(child)
+
+    def cancel(self):
+        with self.lock:
+            self.cancelled.set()
+            for child in self.active:
+                if child.poll() is None:
+                    try:
+                        child.terminate()
+                    except ProcessLookupError:
+                        pass  # The child exited between poll and terminate.
+
+
+def run_jobs(jobs, worker, concurrency, supervisor):
+    """Yield results as slots become free; never queue the entire batch at once."""
+    if concurrency == 1:
+        try:
+            for job in jobs:
+                yield worker(job)
+        except BaseException:
+            supervisor.cancel()
+            raise
+        return
+    pool = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="encode")
+    pending = set()
+    remaining = iter(jobs)
+    try:
+        for _ in range(concurrency):
+            job = next(remaining, None)
+            if job is None:
+                break
+            pending.add(pool.submit(worker, job))
+        while pending:
+            finished, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in finished:
+                yield future.result()
+                job = next(remaining, None)
+                if job is not None:
+                    pending.add(pool.submit(worker, job))
+    except BaseException:
+        supervisor.cancel()
+        raise
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
 
 
 def read_json(path):
@@ -34,8 +120,8 @@ def executable(name):
     return found
 
 
-def probe(tool, source):
-    result = subprocess.run(
+def probe(tool, source, *, runner=None):
+    result = (runner or subprocess.run)(
         [tool, "-v", "error", "-probesize", "100M", "-analyzeduration", "100M",
          "-show_programs", "-show_streams", "-show_format", "-of", "json", str(source)],
         capture_output=True, encoding="utf-8", errors="replace", check=True,
@@ -266,9 +352,12 @@ def publish(partial, target):
         partial.unlink()
 
 
-def encode_one(source, target, args, cfg, ffmpeg, ffprobe):
+def encode_one(source, target, args, cfg, ffmpeg, ffprobe, *, supervisor=None):
+    runner = supervisor.run if supervisor else subprocess.run
+    if supervisor:
+        supervisor.check_cancelled()
     before = fingerprint(source)
-    info = probe(ffprobe, source)
+    info = probe(ffprobe, source, runner=runner)
     video, audios = select_streams(info, args.program, cfg["audio"])
     output_codec = "hevc" if cfg["codec"] in {"libx265", "hevc_nvenc"} else "h264"
     output_duration = expected_duration(info, video, args.start, args.duration)
@@ -281,16 +370,16 @@ def encode_one(source, target, args, cfg, ffmpeg, ffprobe):
     if target.exists():
         if not sidecar.exists() or read_json(sidecar).get("request") != request:
             raise ValueError(f"Existing output has no matching job record; choose another output directory: {target}")
-        validate_output(probe(ffprobe, target), len(audios), output_duration, output_codec, cfg["pix_fmt"])
-        print(f"SKIP {target}", flush=True)
+        validate_output(probe(ffprobe, target, runner=runner), len(audios), output_duration, output_codec, cfg["pix_fmt"])
+        status(f"SKIP {target}")
         return "skipped"
     partial = target.with_name(f".{target.stem}.{uuid.uuid4().hex}.partial.mp4")
     cmd = command(ffmpeg, source, partial, cfg, video, audios, args.start, args.duration,
                   allow_input_errors=args.allow_input_errors)
     if args.allow_input_errors:
-        print("WARNING: Input error recovery enabled; inspect the log and picture/audio near damaged sections.",
-              file=sys.stderr, flush=True)
-    print(subprocess.list2cmdline(cmd), flush=True)
+        status(f"WARNING {source}: Input error recovery enabled; inspect the log and picture/audio near damaged sections.",
+               file=sys.stderr)
+    status(subprocess.list2cmdline(cmd))
     if args.dry_run:
         return "planned"
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -301,21 +390,23 @@ def encode_one(source, target, args, cfg, ffmpeg, ffprobe):
         with log.open("w", encoding="utf-8") as handle:
             handle.write(f"STAGE: {stage}\n" + subprocess.list2cmdline(cmd) + "\n")
             handle.flush()
-            subprocess.run(cmd, stdout=handle, stderr=subprocess.STDOUT, check=True)
+            runner(cmd, stdout=handle, stderr=subprocess.STDOUT, check=True)
             encode_seconds = round(time.monotonic() - started, 3)
             stage = "probe and validate output"
             handle.write(f"\nSTAGE: {stage}\n")
             handle.flush()
-            output = probe(ffprobe, partial)
+            output = probe(ffprobe, partial, runner=runner)
             validate_output(output, len(audios), output_duration, output_codec, cfg["pix_fmt"])
             if args.verify_full:
                 stage = "verify-full (decode output MP4)"
                 handle.write(f"\nSTAGE: {stage}\n")
                 handle.flush()
-                subprocess.run([ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-xerror",
+                runner([ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-xerror",
                                 "-i", str(partial), "-map", "0:v", "-map", "0:a?",
                                 "-f", "null", "-"], stdout=handle, stderr=subprocess.STDOUT, check=True)
         stage = "check source and publish output"
+        if supervisor:
+            supervisor.check_cancelled()
         if fingerprint(source) != before:
             raise ValueError("Source changed during encoding; output will not be published")
         record = {"request": request, "command": cmd, "output_probe": output,
@@ -325,10 +416,10 @@ def encode_one(source, target, args, cfg, ffmpeg, ffprobe):
         # Write the record before publishing; an interrupted job cannot be mistaken for a complete MP4.
         write_json(sidecar, record)
         publish(partial, target)
-        print(f"DONE {target} ({record['elapsed_seconds']}s)", flush=True)
+        status(f"DONE {target} ({record['elapsed_seconds']}s)")
         return "encoded"
     except BaseException:
-        print(f"Job failed during {stage}. Log: {log}", file=sys.stderr, flush=True)
+        status(f"Job failed during {stage}. Log: {log}", file=sys.stderr)
         raise
     finally:
         partial.unlink(missing_ok=True)
@@ -338,6 +429,13 @@ def finite_nonnegative(value):
     number = float(value)
     if not math.isfinite(number) or number < 0:
         raise argparse.ArgumentTypeError("must be finite and nonnegative")
+    return number
+
+
+def positive_int(value):
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be an integer of at least 1")
     return number
 
 
@@ -354,6 +452,8 @@ def main(argv=None):
     parser.add_argument("--program", type=int, help="TS service/program ID, as shown by inspect")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "output")
     parser.add_argument("--recursive", action="store_true")
+    parser.add_argument("--jobs", type=positive_int, default=1,
+                        help="maximum simultaneous files, including probing and output verification (default: 1)")
     parser.add_argument("--min-age", type=finite_nonnegative, default=300,
                         help="skip directory entries modified more recently than this many seconds")
     parser.add_argument("--start", type=finite_nonnegative, default=0)
@@ -389,18 +489,24 @@ def main(argv=None):
         destination.mkdir(parents=True, exist_ok=True)
     counts = {"encoded": 0, "skipped": 0, "planned": 0, "pending": 0, "failed": 0}
 
+    supervisor = ProcessSupervisor()
+
+    def worker(job):
+        path, target = job
+        try:
+            supervisor.check_cancelled()
+            if source.is_dir() and time.time() - path.stat().st_mtime < args.min_age:
+                status(f"PENDING (recently modified) {path}")
+                return "pending"
+            status(f"INPUT {path}")
+            return encode_one(path, target, args, cfg, ffmpeg, ffprobe, supervisor=supervisor)
+        except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+            status(f"FAILED {path}: {exc}", file=sys.stderr)
+            return "failed"
+
     def process():
-        for path, target in jobs:
-            try:
-                if source.is_dir() and time.time() - path.stat().st_mtime < args.min_age:
-                    counts["pending"] += 1
-                    print(f"PENDING (recently modified) {path}", flush=True)
-                    continue
-                print(f"INPUT {path}", flush=True)
-                counts[encode_one(path, target, args, cfg, ffmpeg, ffprobe)] += 1
-            except (OSError, ValueError, subprocess.CalledProcessError) as exc:
-                counts["failed"] += 1
-                print(f"FAILED {path}: {exc}", file=sys.stderr, flush=True)
+        for result in run_jobs(jobs, worker, args.jobs, supervisor):
+            counts[result] += 1
         print(json.dumps(counts), flush=True)
         return 1 if counts["failed"] else 0
 

@@ -4,10 +4,11 @@ Run: py -3 tests/smoke_ffmpeg.py --ffmpeg PATH --ffprobe PATH
 Artifacts are retained under samples/smoke-* for inspection.
 """
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta
 from fractions import Fraction
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -109,6 +110,36 @@ def main():
     report["damaged_input"] = {"damaged_video_packets": changed, "strict": "rejected",
                                "allow_input_errors": "passed", "full_decode": "passed",
                                "recovered_file": str(recovered)}
+    queue = root / "queue-input"
+    queue.mkdir()
+    for name in ("a.ts", "b.ts", "c.ts"):
+        shutil.copyfile(source, queue / name)
+    queue_output = root / "queue-output"
+    queue_cli = ["encode", str(queue), "--output-dir", str(queue_output), "--min-age", "0",
+                 "--profile", "hevc-nvenc" if args.nvenc else "hevc-balanced",
+                 "--ffmpeg", ffmpeg, "--ffprobe", ffprobe, "--verify-full"]
+    assert encode.main(queue_cli + ["--jobs", "2"]) == 0
+    intervals = []
+    timestamps = {}
+    for name in ("a.ts", "b.ts", "c.ts"):
+        target = queue_output / (name + ".mp4")
+        record = encode.read_json(target.with_suffix(".mp4.json"))
+        encode.validate_output(encode.probe(ffprobe, target), 2, 6, "hevc")
+        end = datetime.fromisoformat(record["completed_at"])
+        intervals.append((end - timedelta(seconds=record["elapsed_seconds"]), end))
+        timestamps[name] = target.stat().st_mtime_ns
+    assert any(max(a[0], b[0]) < min(a[1], b[1])
+               for i, a in enumerate(intervals) for b in intervals[i + 1:]), "jobs did not overlap"
+    # Parallelism is operational state, not encoding settings: changing jobs must still skip.
+    assert encode.main(queue_cli + ["--jobs", "1"]) == 0
+    assert all((queue_output / (name + ".mp4")).stat().st_mtime_ns == stamp for name, stamp in timestamps.items())
+    (queue / "bad.ts").write_bytes(b"not a transport stream")
+    assert encode.main(queue_cli + ["--jobs", "2"]) == 1
+    assert not (queue_output / "bad.ts.mp4").exists()
+    assert not list(queue_output.glob("*.partial.mp4"))
+    report["parallel_batch"] = {"jobs": 2, "files": 3, "overlap": "confirmed",
+                                "full_decode": "passed", "resume_with_jobs_1": "passed",
+                                "invalid_input": "rejected", "directory": str(queue_output)}
     encode.write_json(root / "report.json", report)
     print(json.dumps(report, ensure_ascii=False, indent=2))
 

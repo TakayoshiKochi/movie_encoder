@@ -6,6 +6,7 @@ param(
     [string]$Ffprobe = 'ffprobe',
     [string]$Profile = 'hevc-nvenc',
     [int]$MinAge = 300,
+    [ValidateRange(1, 2147483647)][int]$Jobs = 1,
     [int]$ProgramId = -1,
     [switch]$DryRun,
     [switch]$VerifyFull,
@@ -21,7 +22,7 @@ if ([IO.Path]::GetFileNameWithoutExtension($runner.Source) -eq 'py') {
 }
 $cliArgs += @((Join-Path $PSScriptRoot 'encode.py'), 'encode', $InputDirectory,
     '--output-dir', $OutputDirectory, '--profile', $Profile,
-    '--ffmpeg', $Ffmpeg, '--ffprobe', $Ffprobe, '--recursive', '--min-age', "$MinAge")
+    '--ffmpeg', $Ffmpeg, '--ffprobe', $Ffprobe, '--recursive', '--min-age', "$MinAge", '--jobs', "$Jobs")
 if ($ProgramId -ge 0) { $cliArgs += @('--program', "$ProgramId") }
 if ($DryRun) { $cliArgs += '--dry-run' }
 if ($VerifyFull) { $cliArgs += '--verify-full' }

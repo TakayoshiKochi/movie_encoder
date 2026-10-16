@@ -1,8 +1,13 @@
 import argparse
 import copy
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stderr, redirect_stdout
+import io
 import json
 from pathlib import Path
 import tempfile
+import sys
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -324,6 +329,120 @@ class EncodingTests(unittest.TestCase):
              patch("encode.encode_one", side_effect=[ValueError("bad TS"), "planned"]) as job:
             self.assertEqual(encode.main(argv), 1)
             self.assertEqual(job.call_count, 2)
+
+    def test_parallel_batch_respects_limit_and_continues_after_failure(self):
+        inputs = self.root / "queue"
+        inputs.mkdir()
+        for name in ("a.ts", "b.ts", "c.ts", "d.ts"):
+            (inputs / name).write_bytes(b"TS")
+        barrier = threading.Barrier(2)
+        lock = threading.Lock()
+        active = peak = 0
+        visited = []
+
+        def job(path, *args, **kwargs):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+                visited.append(path.name)
+            try:
+                barrier.wait(timeout=5)
+                if path.name == "a.ts":
+                    raise ValueError("bad TS")
+                return "planned"
+            finally:
+                with lock:
+                    active -= 1
+
+        output = io.StringIO()
+        with patch("encode.executable", side_effect=lambda name: name), \
+             patch("encode.encode_one", side_effect=job), redirect_stdout(output):
+            code = encode.main(["encode", str(inputs), "--jobs", "2", "--min-age", "0", "--dry-run"])
+        self.assertEqual(code, 1)
+        self.assertEqual(peak, 2)
+        self.assertCountEqual(visited, ["a.ts", "b.ts", "c.ts", "d.ts"])
+        counts = json.loads(output.getvalue().splitlines()[-1])
+        self.assertEqual((counts["planned"], counts["failed"]), (3, 1))
+
+    def test_invalid_jobs_rejected_before_launching_tools(self):
+        for value in ("0", "-1", "1.5"):
+            with self.subTest(value=value), redirect_stderr(io.StringIO()), \
+                 patch("encode.executable") as launch, self.assertRaises(SystemExit) as error:
+                encode.main(["encode", str(self.source), "--jobs", value])
+            self.assertEqual(error.exception.code, 2)
+            launch.assert_not_called()
+
+    def test_parallel_interrupt_stops_workers_without_starting_remaining_jobs(self):
+        supervisor = encode.ProcessSupervisor()
+        started = []
+        barrier = threading.Barrier(3)
+
+        def worker(job):
+            started.append(job)
+            barrier.wait(timeout=5)
+            self.assertTrue(supervisor.cancelled.wait(timeout=5))
+            return "pending"
+
+        def interrupt(*args, **kwargs):
+            barrier.wait(timeout=5)
+            raise KeyboardInterrupt
+
+        with patch("encode.wait", side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
+            list(encode.run_jobs(list(range(10)), worker, 2, supervisor))
+        self.assertCountEqual(started, [0, 1])
+        self.assertTrue(supervisor.cancelled.is_set())
+
+    def test_supervisor_captures_output_and_propagates_failure(self):
+        supervisor = encode.ProcessSupervisor()
+        result = supervisor.run([sys.executable, "-c", "print('ok')"], capture_output=True, encoding="utf-8", check=True)
+        self.assertEqual(result.stdout.strip(), "ok")
+        with self.assertRaises(encode.subprocess.CalledProcessError) as error:
+            supervisor.run([sys.executable, "-c", "import sys; print('bad', file=sys.stderr); sys.exit(7)"],
+                           capture_output=True, encoding="utf-8", check=True)
+        self.assertEqual(error.exception.returncode, 7)
+        self.assertIn("bad", error.exception.stderr)
+        self.assertFalse(supervisor.active)
+
+    def test_cancellation_terminates_child_and_prevents_new_launches(self):
+        supervisor = encode.ProcessSupervisor()
+        spawned = threading.Event()
+        original_popen = encode.subprocess.Popen
+        children = []
+
+        def spawn(*args, **kwargs):
+            child = original_popen(*args, **kwargs)
+            children.append(child)
+            spawned.set()
+            return child
+
+        with patch("encode.subprocess.Popen", side_effect=spawn), ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(supervisor.run, [sys.executable, "-c", "import time; time.sleep(60)"], check=True)
+            try:
+                self.assertTrue(spawned.wait(timeout=5))
+            finally:
+                supervisor.cancel()
+            with self.assertRaises(InterruptedError):
+                future.result(timeout=5)
+        self.assertIsNotNone(children[0].poll())
+        self.assertFalse(supervisor.active)
+        with patch("encode.subprocess.Popen") as spawn, self.assertRaises(InterruptedError):
+            supervisor.run([sys.executable, "-c", "pass"])
+        spawn.assert_not_called()
+
+    def test_cancelled_encode_does_not_publish_partial_output(self):
+        supervisor = encode.ProcessSupervisor()
+
+        def finish_then_cancel(cmd, **kwargs):
+            self.fake_ffmpeg(cmd)
+            supervisor.cancel()
+
+        with patch("encode.probe", side_effect=[INFO, OUTPUT]), \
+             patch.object(supervisor, "run", side_effect=finish_then_cancel), self.assertRaises(InterruptedError):
+            encode.encode_one(self.source, self.target, self.args, self.cfg, "ffmpeg", "ffprobe", supervisor=supervisor)
+        self.assertFalse(self.target.exists())
+        self.assertFalse(list(self.target.parent.glob("*.partial.mp4")))
+        self.assertEqual(self.source.read_bytes(), b"original TS")
 
 
 if __name__ == "__main__":
