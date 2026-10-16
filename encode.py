@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TS -> H.265 (x265) or H.264 (x264) / AAC MP4. Python 3.10+, standard library only."""
+"""TS -> H.265 (x265/NVENC) or H.264 (x264) / AAC MP4. Python 3.10+, standard library only."""
 from __future__ import annotations
 
 import argparse
@@ -66,7 +66,7 @@ def select_streams(info, program=None, audio="all"):
     return videos[0], audios
 
 
-def load_profile(path, name, crf=None):
+def load_profile(path, name, crf=None, cq=None):
     profiles = read_json(path)
     if name not in profiles:
         raise ValueError(f"Unknown profile {name}; choose from {', '.join(profiles)}")
@@ -76,22 +76,34 @@ def load_profile(path, name, crf=None):
     cfg.setdefault("pix_fmt", "yuv420p")
     cfg.setdefault("x265_params", "")
     cfg.setdefault("audio_sample_rate", 48000)
-    required = {"crf", "preset", "tune", "deinterlace", "parity", "deint_frames",
+    nvenc = cfg["codec"] == "hevc_nvenc"
+    required = {"preset", "tune", "deinterlace", "parity", "deint_frames",
                 "audio", "audio_bitrate", "surround_bitrate", "x264_params",
                 "codec", "pix_fmt", "x265_params", "audio_sample_rate"}
+    required |= {"cq", "nvenc"} if nvenc else {"crf"}
     if set(cfg) != required:
         raise ValueError(f"Profile keys must be: {', '.join(sorted(required))}")
-    if crf is not None:
-        cfg["crf"] = crf
-    if isinstance(cfg["crf"], bool) or not isinstance(cfg["crf"], (int, float)) or not 0 <= cfg["crf"] <= 51:
-        raise ValueError("crf must be a number from 0 to 51")
-    if cfg["codec"] not in {"libx264", "libx265"}:
-        raise ValueError("codec must be libx264 or libx265")
+    if nvenc and crf is not None:
+        raise ValueError("NVENC uses --cq, not --crf; their quality scales are not equivalent")
+    if not nvenc and cq is not None:
+        raise ValueError("--cq requires a hevc_nvenc profile; use --crf for x264/x265")
+    quality_key = "cq" if nvenc else "crf"
+    override = cq if nvenc else crf
+    if override is not None:
+        cfg[quality_key] = override
+    value = cfg[quality_key]
+    if (isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 51
+            or (nvenc and value == 0)):
+        raise ValueError(f"{quality_key} must be a number {'greater than 0 and up to 51' if nvenc else 'from 0 to 51'}")
+    if cfg["codec"] not in {"libx264", "libx265", "hevc_nvenc"}:
+        raise ValueError("codec must be libx264, libx265 or hevc_nvenc")
     if cfg["pix_fmt"] not in ({"yuv420p", "yuv420p10le"} if cfg["codec"] == "libx265" else {"yuv420p"}):
         raise ValueError("Unsupported pixel format for the selected codec")
-    if cfg["preset"] not in {"ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"}:
+    presets = ({f"p{i}" for i in range(1, 8)} if nvenc else
+               {"ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"})
+    if cfg["preset"] not in presets:
         raise ValueError("Invalid encoder preset")
-    tunes = {None, "animation", "grain", "fastdecode", "zerolatency", "psnr", "ssim"}
+    tunes = {"hq", "ll", "ull"} if nvenc else {None, "animation", "grain", "fastdecode", "zerolatency", "psnr", "ssim"}
     if cfg["codec"] == "libx264":
         tunes |= {"film", "stillimage"}
     if cfg["tune"] not in tunes:
@@ -109,9 +121,21 @@ def load_profile(path, name, crf=None):
     for key in ("x264_params", "x265_params"):
         if not isinstance(cfg[key], str):
             raise ValueError(f"{key} must be a string")
-    inactive = "x264_params" if cfg["codec"] == "libx265" else "x265_params"
-    if cfg[inactive]:
-        raise ValueError(f"{inactive} must be empty for {cfg['codec']}")
+        active_codec = "libx264" if key == "x264_params" else "libx265"
+        if cfg["codec"] != active_codec and cfg[key]:
+            raise ValueError(f"{key} must be empty for {cfg['codec']}")
+    if nvenc:
+        options = cfg["nvenc"]
+        if not isinstance(options, dict) or set(options) != {"lookahead", "spatial_aq", "temporal_aq", "multipass", "bframes"}:
+            raise ValueError("nvenc requires lookahead, spatial_aq, temporal_aq, multipass and bframes")
+        for key, low, high in (("lookahead", 0, 32), ("bframes", 0, 4)):
+            if type(options[key]) is not int or not low <= options[key] <= high:
+                raise ValueError(f"nvenc.{key} must be an integer from {low} to {high}")
+        for key in ("spatial_aq", "temporal_aq"):
+            if type(options[key]) is not bool:
+                raise ValueError(f"nvenc.{key} must be true or false")
+        if options["multipass"] not in {"disabled", "qres", "fullres"}:
+            raise ValueError("Invalid nvenc.multipass")
     return cfg
 
 
@@ -134,9 +158,18 @@ def command(ffmpeg, source, target, cfg, video, audios, start=0, duration=None,
     if cfg["deinterlace"] != "off":
         mode = "send_field" if cfg["deinterlace"] == "bob" else "send_frame"
         args += ["-vf", f"bwdif=mode={mode}:parity={cfg['parity']}:deint={cfg['deint_frames']}"]
-    args += ["-c:v", cfg["codec"], "-preset", cfg["preset"], "-crf", str(cfg["crf"]),
+    args += ["-c:v", cfg["codec"], "-preset", cfg["preset"],
              "-pix_fmt", cfg["pix_fmt"], "-fps_mode", "vfr"]
-    if cfg["codec"] == "libx265":
+    if cfg["codec"] == "hevc_nvenc":
+        options = cfg["nvenc"]
+        args += ["-rc", "vbr", "-cq", str(cfg["cq"]), "-b:v", "0",
+                 "-rc-lookahead", str(options["lookahead"]),
+                 "-spatial-aq", str(int(options["spatial_aq"])),
+                 "-temporal-aq", str(int(options["temporal_aq"])),
+                 "-multipass", options["multipass"], "-bf", str(options["bframes"])]
+    else:
+        args += ["-crf", str(cfg["crf"])]
+    if cfg["codec"] in {"libx265", "hevc_nvenc"}:
         args += ["-tag:v", "hvc1"]
     if cfg["tune"]:
         args += ["-tune", cfg["tune"]]
@@ -237,7 +270,7 @@ def encode_one(source, target, args, cfg, ffmpeg, ffprobe):
     before = fingerprint(source)
     info = probe(ffprobe, source)
     video, audios = select_streams(info, args.program, cfg["audio"])
-    output_codec = "hevc" if cfg["codec"] == "libx265" else "h264"
+    output_codec = "hevc" if cfg["codec"] in {"libx265", "hevc_nvenc"} else "h264"
     output_duration = expected_duration(info, video, args.start, args.duration)
     request = {"source": before, "profile": cfg, "program": args.program,
                "start": args.start, "duration": args.duration, "verify_full": args.verify_full}
@@ -269,6 +302,7 @@ def encode_one(source, target, args, cfg, ffmpeg, ffprobe):
             handle.write(f"STAGE: {stage}\n" + subprocess.list2cmdline(cmd) + "\n")
             handle.flush()
             subprocess.run(cmd, stdout=handle, stderr=subprocess.STDOUT, check=True)
+            encode_seconds = round(time.monotonic() - started, 3)
             stage = "probe and validate output"
             handle.write(f"\nSTAGE: {stage}\n")
             handle.flush()
@@ -285,6 +319,7 @@ def encode_one(source, target, args, cfg, ffmpeg, ffprobe):
         if fingerprint(source) != before:
             raise ValueError("Source changed during encoding; output will not be published")
         record = {"request": request, "command": cmd, "output_probe": output,
+                  "encode_seconds": encode_seconds,
                   "elapsed_seconds": round(time.monotonic() - started, 2),
                   "completed_at": datetime.now(timezone.utc).isoformat(), "log": str(log)}
         # Write the record before publishing; an interrupted job cannot be mistaken for a complete MP4.
@@ -313,8 +348,9 @@ def main(argv=None):
     parser.add_argument("--ffmpeg", default="ffmpeg")
     parser.add_argument("--ffprobe", default="ffprobe")
     parser.add_argument("--config", type=Path, default=ROOT / "profiles.json")
-    parser.add_argument("--profile", default="hevc-balanced")
+    parser.add_argument("--profile", default="hevc-nvenc")
     parser.add_argument("--crf", type=float)
+    parser.add_argument("--cq", type=float, help="NVENC target quality (greater than 0, up to 51); not equivalent to CRF")
     parser.add_argument("--program", type=int, help="TS service/program ID, as shown by inspect")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "output")
     parser.add_argument("--recursive", action="store_true")
@@ -337,7 +373,7 @@ def main(argv=None):
         print(json.dumps(probe(ffprobe, source), ensure_ascii=False, indent=2))
         return 0
     ffmpeg = executable(args.ffmpeg)
-    cfg = load_profile(args.config, args.profile, args.crf)
+    cfg = load_profile(args.config, args.profile, args.crf, args.cq)
     if source.is_file():
         files = [source]
     elif source.is_dir():

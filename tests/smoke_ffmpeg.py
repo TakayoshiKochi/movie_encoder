@@ -19,6 +19,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ffmpeg", default="ffmpeg")
     parser.add_argument("--ffprobe", default="ffprobe")
+    parser.add_argument("--nvenc", action="store_true", help="also require and test a working HEVC NVENC GPU")
     args = parser.parse_args()
     ffmpeg = encode.executable(args.ffmpeg)
     ffprobe = encode.executable(args.ffprobe)
@@ -44,9 +45,12 @@ def main():
     assert len(input_audios) == 2, input_audios
     report = {"ffmpeg": subprocess.check_output([ffmpeg, "-version"], text=True).splitlines()[0],
               "input": str(source), "results": []}
-    for profile, codec, rate in [("hevc-balanced", "hevc", Fraction(30000, 1001)),
-                                 ("hevc-bob", "hevc", Fraction(60000, 1001)),
-                                 ("tv-balanced", "h264", Fraction(60000, 1001))]:
+    profiles = [("hevc-balanced", "hevc", Fraction(30000, 1001)),
+                ("hevc-bob", "hevc", Fraction(60000, 1001)),
+                ("tv-balanced", "h264", Fraction(60000, 1001))]
+    if args.nvenc:
+        profiles.append(("hevc-nvenc", "hevc", Fraction(30000, 1001)))
+    for profile, codec, rate in profiles:
         output_dir = root / profile
         cli = ["encode", str(source), "--profile", profile, "--output-dir", str(output_dir),
                "--ffmpeg", ffmpeg, "--ffprobe", ffprobe, "--verify-full"]
@@ -63,7 +67,9 @@ def main():
         before = target.stat().st_mtime_ns
         assert encode.main(cli) == 0, "resume"
         assert target.stat().st_mtime_ns == before, "resume unexpectedly rewrote the MP4"
+        record = encode.read_json(target.with_suffix(".mp4.json"))
         report["results"].append({"profile": profile, "file": str(target),
+                                  "bytes": target.stat().st_size, "encode_seconds": record["encode_seconds"],
                                   "video_codec": video["codec_name"], "pix_fmt": video["pix_fmt"],
                                   "fps": video["avg_frame_rate"], "field_order": video["field_order"],
                                   "sar": video["sample_aspect_ratio"], "audio_tracks": len(audios),
@@ -90,7 +96,8 @@ def main():
     assert changed == 3, "not enough video packets to damage"
     damaged_source = root / "damaged.ts"
     damaged_source.write_bytes(damaged)
-    base = ["encode", str(damaged_source), "--ffmpeg", ffmpeg, "--ffprobe", ffprobe, "--verify-full"]
+    base = ["encode", str(damaged_source), "--profile", "hevc-balanced",
+            "--ffmpeg", ffmpeg, "--ffprobe", ffprobe, "--verify-full"]
     strict_dir = root / "damaged-strict"
     assert encode.main(base + ["--output-dir", str(strict_dir)]) == 1, "strict mode accepted damaged input"
     assert not (strict_dir / "damaged.ts.mp4").exists()

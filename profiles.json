@@ -1,4 +1,27 @@
 {
+  "hevc-nvenc": {
+    "codec": "hevc_nvenc",
+    "pix_fmt": "yuv420p",
+    "cq": 24,
+    "preset": "p6",
+    "tune": "hq",
+    "nvenc": {
+      "lookahead": 32,
+      "spatial_aq": true,
+      "temporal_aq": true,
+      "multipass": "fullres",
+      "bframes": 3
+    },
+    "deinterlace": "frame",
+    "parity": "auto",
+    "deint_frames": "interlaced",
+    "audio": "all",
+    "audio_bitrate": "192k",
+    "surround_bitrate": "384k",
+    "audio_sample_rate": 48000,
+    "x264_params": "",
+    "x265_params": ""
+  },
   "hevc-balanced": {
     "codec": "libx265",
     "pix_fmt": "yuv420p",

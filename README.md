@@ -1,15 +1,15 @@
 # TV 録画 TS → MP4 自動エンコード
 
-Windows / PowerShell 向け。Python の標準ライブラリーでキューを処理し、FFmpeg の **libx265** で H.265/HEVC、音声は AAC に変換します。H.264 用の libx264 プロファイルも選べます。x264.exe / x265.exe の別途導入は不要です。TMPGEnc のフィルターや品質値と完全に一致するものではなく、短い実写・アニメ・動きの多い場面を比較して設定を決めるための土台です。
+Windows / PowerShell 向け。Python の標準ライブラリーでキューを処理し、FFmpeg の **hevc_nvenc** または **libx265** で H.265/HEVC、音声は AAC に変換します。H.264 用の libx264 プロファイルも選べます。既定は NVENC CQ 24 です。x264.exe / x265.exe の別途導入は不要です。TMPGEnc のフィルターや品質値と完全に一致するものではなく、短い実写・アニメ・動きの多い場面を比較して設定を決めるための土台です。
 
-現在の TMPGEnc 設定は「適応補間でインターレース解除、MP4 / HEVC、YUV 4:2:0・8bit/ch、VBR（固定品質）50%、フレームレートは入力に合わせる、音声48kHz / 128～192kbps」。これに合わせ、初期値は HEVC / yuv420p（YUV 4:2:0・8bit/ch）/ CRF 22 / medium、入力フレームレートを倍化しない bwdif、AAC 48kHz / 192kbps（2ch以下）としています。サラウンドは別途384kbpsにしています。
+現在の TMPGEnc 設定は「適応補間でインターレース解除、MP4 / HEVC、YUV 4:2:0・8bit/ch、VBR（固定品質）50%、フレームレートは入力に合わせる、音声48kHz / 128～192kbps」。これに合わせたサンプル比較後、既定として NVENC / HEVC / yuv420p（YUV 4:2:0・8bit/ch）/ CQ 24 / p6 / hq を採用しました。入力フレームレートを倍化しない bwdif、AAC 48kHz / 192kbps（2ch以下）とし、サラウンドは別途384kbpsにしています。
 
-**品質50%から CRF への換算式はありません。CRF 22 は同等画質を保証する値ではなく、比較用の暫定値です。** TMPGEnc の「適応補間」と bwdif も同一アルゴリズムとは扱いません。実写・アニメ混在のため tune は指定せず、24p 化は自動実行しません。
+**品質50%から CRF への換算式はありません。CRF 22 は TMPGEnc と同等画質を保証する値ではありませんが、サンプル比較後の採用値です。** TMPGEnc の「適応補間」と bwdif も同一アルゴリズムとは扱いません。実写・アニメ混在のため x265 の tune は指定せず、24p 化は自動実行しません。
 
 ## 用意するもの
 
 - Python 3.10 以降（以下の `py -3` が動作すること。Python 実行ファイルのフルパスでも可）
-- `ffmpeg.exe` と `ffprobe.exe`。FFmpeg 5.1 以降を想定し、libx265（H.264を使う場合はlibx264）、AAC、bwdif が使えるビルドが必要です。
+- `ffmpeg.exe` と `ffprobe.exe`。既定プロファイルでは対応するNVIDIA GPU・ドライバーとhevc_nvencが必要です。x265プロファイルではlibx265、H.264ではlibx264が必要です。共通してAACとbwdifも使えるビルドを使用します（FFmpeg 5.1以降を想定、実機検証は9.0.2）。
 - FFmpeg で映像・音声をデコードできる TS。暗号化解除の機能はありません。
 
 [FFmpeg 公式ダウンロード案内](https://ffmpeg.org/download.html) に Windows ビルドのリンクがあります。2 本の exe が入った bin フォルダーを PATH に加えるか、毎回 `--ffmpeg` / `--ffprobe` でフルパスを渡します。スクリプトが依存ソフトを自動インストールすることはありません。
@@ -19,7 +19,16 @@ py -3 --version
 ffmpeg -version
 ffprobe -version
 ffmpeg -hide_banner -h encoder=libx265
+ffmpeg -hide_banner -h encoder=hevc_nvenc
 ```
+
+プロファイルと品質の指定を省略すると、Python・定期実行用PowerShellとも `hevc-nvenc` / CQ 24 を使います。
+
+```powershell
+py -3 .\encode.py encode 'D:\Recordings\番組.ts' --output-dir 'D:\Encoded-NVENC' --verify-full
+```
+
+従来のコマンドで `--profile hevc-balanced` やPowerShellの `-Profile hevc-balanced` を明示していれば、引き続きx265になります。NVENCの既定値へ移行する場合はその指定と `--crf 22` を外します。CQは必要な場合だけ `--cq` で上書きできます。既存出力と設定が異なる場合は上書きしないため、移行時は別の出力先を使ってください。
 
 Chocolatey でインストールした場合、インストール前から開いているアプリには PATH の変更が反映されないことがあります。PowerShell を開き直すか、次のようにフルパスを指定します（Chocolatey の標準配置の場合）。
 
@@ -63,15 +72,37 @@ py -3 .\encode.py encode 'D:\Recordings\番組.ts' --profile hevc-balanced --sta
 
 確認する場面は、暗部、細かい模様、字幕テロップ、パン、スポーツなどの速い動きです。TMPGEnc の出力とも同じ場面で比較してください。
 
+## x265 と NVENC を比較する
+
+対応する NVIDIA GPU とドライバー、FFmpegの `hevc_nvenc` が必要です。`ffmpeg -h encoder=hevc_nvenc` はビルドの対応確認で、GPUでの実行可否まで保証するものではありません。非対応環境では変換が失敗してログを残し、x265へ自動切替はしません。
+
+`hevc-nvenc` は、x265用の `hevc-balanced` と同じインターレース解除・解像度・SAR・入力fps・YUV 4:2:0 8bit・音声設定で、映像エンコーダーをNVENCにします。入力のデコードとbwdifはCPUのままにし、GPUデコード・別のGPUフィルターによる見た目の差を持ち込みません。
+
+```powershell
+py -3 .\encode.py encode 'D:\Recordings\番組.ts' --profile hevc-balanced --crf 22 --start 300 --duration 60 --output-dir '.\samples\compare-x265' --verify-full
+py -3 .\encode.py encode 'D:\Recordings\番組.ts' --profile hevc-nvenc --cq 22 --start 300 --duration 60 --output-dir '.\samples\compare-nvenc22' --verify-full
+py -3 .\encode.py encode 'D:\Recordings\番組.ts' --profile hevc-nvenc --cq 26 --start 300 --duration 60 --output-dir '.\samples\compare-nvenc26' --verify-full
+py -3 .\encode.py encode 'D:\Recordings\番組.ts' --profile hevc-nvenc --cq 30 --start 300 --duration 60 --output-dir '.\samples\compare-nvenc30' --verify-full
+```
+
+必要に応じて全コマンドへ同じ `--program` と、前述のFFmpeg/ffprobeフルパスを追加してください。破損箇所を含める場合は同じ `--allow-input-errors` を付けます。
+
+**CRF 22 と CQ 22 は同等画質を意味しません。** 上のCQ値は比較を始めるための候補です。見た目を揃えて容量・時間を比べるか、CQを調整して容量を近づけたうえで画質を比べます。CQが小さいほど品質を高める方向ですが、TMPGEncの品質%との換算はありません。CQ=0は自動設定になるため、このスクリプトでは指定を拒否します。NVENCに `--crf`、x265/x264に `--cq` を指定した場合もエラーにします。
+
+NVENCの初期値は `p6 / hq / VBR-CQ`、目標平均ビットレートを指定しない `-b:v 0`、先読み32フレーム、spatial/temporal AQ有効、Bフレーム3枚、`multipass=fullres` です。これは画質と圧縮効率を考慮した比較用設定であり、TMPGEncのNVENC設定を再現するものではありません。NVENCのmultipassは内部のフレーム解析方式で、動画全体を2回処理するx265の2-pass ABRとは異なります。古いGPUやドライバーでこれらの機能が使えない場合はログを確認し、専用プロファイルを複製して `nvenc` の設定を調整してください。
+
+出力 `.mp4.json` の `encode_seconds` は、FFmpegによる入力デコード・シーク・フィルター・映像/音声エンコード・MP4出力までの時間で、後段の出力検査を含みません。`elapsed_seconds` は後段の検査を含む合計です。容量はMP4のファイルサイズで比較できます。先頭までの読み飛ばしや短い素材の起動コストも時間に含まれるため、エンコーダー単体の速度とは区別し、長めの同じ区間で比較してください。
+
 ## 設定ファイル
 
 `profiles.json` を編集します。独自のプロファイルを複製して名前を付け、`--profile 名前` で選べます。別ファイルは `--config パス` で指定できます。
 
-| プロファイル | CRF / preset | インターレース処理 | 用途の出発点 |
+| プロファイル | 品質 / preset | インターレース処理 | 用途の出発点 |
 |---|---|---|---|
-| `hevc-balanced`（初期値） | 22 / medium | bwdif、1 入力フレーム → 1 フレーム | HEVC、現在の入力fps維持に合わせる |
+| `hevc-balanced` | CRF 22 / medium | bwdif、1 入力フレーム → 1 フレーム | HEVC、x265比較・CPUで処理したい場合 |
 | `hevc-bob` | 22 / medium | bwdif、1 フィールド → 1 フレーム | HEVC、59.94p等で動きを優先する比較用 |
 | `hevc-progressive` | 22 / medium | 解除しない | HEVC、プログレッシブと確認できた素材 |
+| `hevc-nvenc`（初期値） | CQ 24 / p6 | bwdif、1 入力フレーム → 1 フレーム | HEVC、NVENC採用設定 |
 | `tv-balanced` | 20 / slow | bwdif、1 フィールド → 1 フレーム | H.264、動きを優先 |
 | `tv-small` | 23 / slow | bwdif、1 入力フレーム → 1 フレーム | H.264、容量優先 |
 | `progressive` | 20 / slow | 解除しない | H.264、プログレッシブ素材 |
@@ -80,11 +111,13 @@ py -3 .\encode.py encode 'D:\Recordings\番組.ts' --profile hevc-balanced --sta
 
 | キー | 変更の目安 |
 |---|---|
-| `codec` | `libx265` = HEVC、`libx264` = H.264。省略時は旧設定互換のため libx264 |
-| `pix_fmt` | HEVCは `yuv420p`（8bit）または `yuv420p10le`（10bit）。省略時8bit。H.264はこのスクリプトでは8bitのみ |
+| `codec` | `libx265` / `hevc_nvenc` = HEVC、`libx264` = H.264。省略時は旧設定互換のため libx264 |
+| `pix_fmt` | libx265は `yuv420p`（8bit）または `yuv420p10le`（10bit）。省略時8bit。NVENC/H.264はこのスクリプトでは8bitのみ |
 | `crf` | 小さいほど高画質・大容量の傾向。HEVCはまず 20 / 22 / 24 を比較。`--crf` で一時上書き可能。x264とx265の同じCRF値は同等画質を意味しない |
 | `preset` | 速度と圧縮効率の調整。HEVCはmediumから開始し、余裕があればslowを比較。CRFを固定しても容量・画質は完全には一致しない |
-| `tune` | 混在素材は `null`。必要なら `animation` / `grain` を比較。`film` はlibx264のみで使用可 |
+| `cq` | NVENC専用。0より大きく51以下。`--cq`で上書き。NVENCプロファイルにはcrfを入れない |
+| `nvenc` | NVENC専用の設定オブジェクト。`lookahead`（0～32）、`spatial_aq` / `temporal_aq`（真偽値）、`multipass`（disabled/qres/fullres）、`bframes`（0～4）。presetはp1～p7 |
+| `tune` | x265の混在素材は `null`。必要なら `animation` / `grain` を比較。`film` はlibx264のみで使用可。NVENCはhq/ll/ullから選ぶ |
 | `deinterlace` | `bob` / `frame` / `off` |
 | `parity` | `auto` が基本。フィールド順を確認できた場合に `tff` / `bff` |
 | `deint_frames` | 初期値 `interlaced` はインターレースとマークされたフレームのみ。マークが誤っている素材は調査後に `all` |
@@ -93,7 +126,7 @@ py -3 .\encode.py encode 'D:\Recordings\番組.ts' --profile hevc-balanced --sta
 | `audio_bitrate` | 2ch 以下の音声 1 トラックあたり。初期値 `192k` |
 | `surround_bitrate` | 3ch 以上の音声 1 トラックあたり。初期値 `384k` |
 | `x264_params` | 初期値は空。例 `aq-mode=3:deblock=-1,-1`。高度な設定が必要な場合のみ |
-| `x265_params` | 初期値は空。HEVC用の詳細設定。libx264では空にする。libx265ではx264_paramsを空にする |
+| `x265_params` | 初期値は空。libx265専用の詳細設定。NVENCではx264_paramsとx265_paramsを両方空にする |
 
 映像は選択したコーデックとピクセル形式で、元の解像度とピクセルアスペクト比を維持します。HEVC の MP4 は hvc1 タグで出力します。再生機器でのHEVC・10bit対応は実機で確認してください。1440×1080 / SAR 4:3 の映像を 1920×1080 に拡大する処理は加えていません。AAC は48kHzに揃え、入力のチャンネル数を基本的に維持し、ステレオへ強制変換しません。言語・タイトルのタグが取得できれば引き継ぎます。
 
@@ -174,6 +207,10 @@ py -3 -m unittest discover -s tests -v
 py -3 .\tests\smoke_ffmpeg.py --ffmpeg 'C:\ProgramData\chocolatey\bin\ffmpeg.exe' --ffprobe 'C:\ProgramData\chocolatey\bin\ffprobe.exe'
 ```
 
+対応GPUがある場合は、このコマンドに `--nvenc` を追加するとNVENCの変換・全体デコード・入力fps/形式/音声/SAR・再開も検査します。`--nvenc` でNVENCが利用できない場合は検査失敗になり、スキップはしません。レポートには各MP4のサイズとエンコード段階の処理時間も記録します。6秒の人工素材は動作確認用であり、実番組の画質・容量・速度を代表するベンチマークではありません。
+
+2026-10-16、GeForce RTX 5080 / NVIDIA Driver 617.42 / FFmpeg 9.0.2 で `--nvenc` を含む動作確認が成功しました。NVENCでもHEVC・YUV 4:2:0 8bit・約29.97p・SAR保持・AAC 48kHzの2音声・全体デコード・再開を確認しています。
+
 2026-10-16、Chocolatey の FFmpeg / ffprobe 9.0.2（gyan.dev essentials build）で上記の動作確認を実行し、全3プロファイルで成功しました。HEVC初期設定は約29.97p、bobは約59.94p、全出力でYUV 4:2:0・8bitとAAC 48kHz・2音声を確認しています。実際の放送TSのドロップ・方式混在・途中の音声構成変更や主観画質・同期は、この人工素材での検査には含みません。
 
 ## 公式仕様
@@ -181,6 +218,7 @@ py -3 .\tests\smoke_ffmpeg.py --ffmpeg 'C:\ProgramData\chocolatey\bin\ffmpeg.exe
 - [FFmpeg の入力・出力とストリーム選択](https://ffmpeg.org/ffmpeg.html)
 - [libx264 の設定と x264-params](https://ffmpeg.org/ffmpeg-codecs.html#libx264_002c-libx264rgb)
 - [libx265 の設定と x265-params](https://ffmpeg.org/ffmpeg-codecs.html#libx265)
+- [NVIDIA のFFmpeg NVENC設定](https://docs.nvidia.com/video-technologies/video-codec-sdk/13.1/ffmpeg-with-nvidia-gpu/)
 - [x265 のCRF・品質指定](https://x265.readthedocs.io/en/master/cli.html#quality-rate-control-and-rate-distortion-options)
 - [bwdif の mode / parity / deint](https://ffmpeg.org/ffmpeg-filters.html#bwdif)
 - [ffprobe の JSON 出力](https://ffmpeg.org/ffprobe.html)

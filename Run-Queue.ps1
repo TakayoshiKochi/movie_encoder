@@ -4,7 +4,7 @@ param(
     [string]$Python = 'py',
     [string]$Ffmpeg = 'ffmpeg',
     [string]$Ffprobe = 'ffprobe',
-    [string]$Profile = 'hevc-balanced',
+    [string]$Profile = 'hevc-nvenc',
     [int]$MinAge = 300,
     [int]$ProgramId = -1,
     [switch]$DryRun,

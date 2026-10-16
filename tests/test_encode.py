@@ -115,6 +115,48 @@ class EncodingTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 encode.load_profile(path, "test")
 
+    def test_nvenc_command_uses_cq_and_shared_filters(self):
+        cfg = encode.load_profile(encode.ROOT / "profiles.json", "hevc-nvenc", cq=26)
+        cmd = encode.command("ffmpeg", self.source, self.target, cfg, VIDEO, [AUDIO])
+        for flag, value in (("-c:v", "hevc_nvenc"), ("-cq", "26"), ("-rc", "vbr"),
+                            ("-b:v", "0"), ("-preset", "p6"), ("-tune", "hq"),
+                            ("-rc-lookahead", "32"), ("-multipass", "fullres"),
+                            ("-bf", "3"), ("-spatial-aq", "1"), ("-temporal-aq", "1"),
+                            ("-ar", "48000"), ("-tag:v", "hvc1"), ("-pix_fmt", "yuv420p")):
+            self.assertEqual(cmd[cmd.index(flag) + 1], value)
+        self.assertIn("bwdif=mode=send_frame:parity=auto:deint=interlaced", cmd)
+        for option in ("-crf", "-x264-params", "-x265-params", "-hwaccel"):
+            self.assertNotIn(option, cmd)
+
+    def test_nvenc_publish_and_resume(self):
+        self.cfg = encode.load_profile(encode.ROOT / "profiles.json", "hevc-nvenc")
+        self.assertEqual(self.run_job(probe=[INFO, self.hevc_output()]), "encoded")
+        record = encode.read_json(self.target.with_suffix(".mp4.json"))
+        self.assertIn("encode_seconds", record)
+        self.assertEqual(record["request"]["profile"]["cq"], 24)
+        self.assertEqual(self.run_job(probe=[INFO, self.hevc_output()]), "skipped")
+
+    def test_crf_and_cq_cannot_be_mixed(self):
+        for profile, kwargs in (("hevc-nvenc", {"crf": 22}), ("hevc-balanced", {"cq": 22})):
+            with self.assertRaises(ValueError):
+                encode.load_profile(encode.ROOT / "profiles.json", profile, **kwargs)
+        for value in (0, -1, 52, float("nan"), float("inf"), True):
+            with self.assertRaises(ValueError):
+                encode.load_profile(encode.ROOT / "profiles.json", "hevc-nvenc", cq=value)
+
+    def test_nvenc_profile_rejects_unsupported_options(self):
+        cfg = encode.load_profile(encode.ROOT / "profiles.json", "hevc-nvenc")
+        path = self.root / "nvenc.json"
+        changes = [{"preset": "medium"}, {"tune": "animation"}, {"x265_params": "aq-mode=3"},
+                   {"pix_fmt": "yuv420p10le"}, {"crf": 22}]
+        for key, value in (("lookahead", 33), ("bframes", -1), ("spatial_aq", 1),
+                           ("multipass", "two-pass")):
+            changes.append({"nvenc": {**cfg["nvenc"], key: value}})
+        for change in changes:
+            encode.write_json(path, {"test": {**cfg, **change}})
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                encode.load_profile(path, "test")
+
     def test_audio_sample_rate_is_verified(self):
         output = copy.deepcopy(OUTPUT)
         output["streams"][1]["sample_rate"] = "44100"
