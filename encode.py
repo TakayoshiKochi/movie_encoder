@@ -10,6 +10,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -225,8 +226,26 @@ def load_profile(path, name, crf=None, cq=None):
     return cfg
 
 
+def video_filter(cfg, resize=None):
+    filters = []
+    if cfg["deinterlace"] != "off":
+        mode = "send_field" if cfg["deinterlace"] == "bob" else "send_frame"
+        filters.append(f"bwdif=mode={mode}:parity={cfg['parity']}:deint={cfg['deint_frames']}")
+    if resize is not None:
+        width, height = resize
+        # dar includes input SAR: 1440x1080 with SAR 4:3 is 16:9, not 4:3.
+        # Round content dimensions down to even pixels for YUV 4:2:0 encoders.
+        filters += [
+            f"scale=w='max(2,trunc(min({width},{height}*dar)/2)*2)'"
+            f":h='max(2,trunc(min({height},{width}/dar)/2)*2)':flags=lanczos",
+            "setsar=1",
+            f"pad={width}:{height}:x='trunc((ow-iw)/4)*2':y='trunc((oh-ih)/4)*2':color=black",
+        ]
+    return ",".join(filters)
+
+
 def command(ffmpeg, source, target, cfg, video, audios, start=0, duration=None,
-            allow_input_errors=False):
+            allow_input_errors=False, resize=None):
     args = [ffmpeg, "-hide_banner", "-nostdin", "-n", "-loglevel", "info"]
     if not allow_input_errors:
         args += ["-xerror"]
@@ -241,9 +260,9 @@ def command(ffmpeg, source, target, cfg, video, audios, start=0, duration=None,
     for stream in audios:
         args += ["-map", f"0:{stream['index']}"]
     args += ["-map_metadata", "-1", "-map_chapters", "-1", "-sn", "-dn"]
-    if cfg["deinterlace"] != "off":
-        mode = "send_field" if cfg["deinterlace"] == "bob" else "send_frame"
-        args += ["-vf", f"bwdif=mode={mode}:parity={cfg['parity']}:deint={cfg['deint_frames']}"]
+    filters = video_filter(cfg, resize)
+    if filters:
+        args += ["-vf", filters]
     args += ["-c:v", cfg["codec"], "-preset", cfg["preset"],
              "-pix_fmt", cfg["pix_fmt"], "-fps_mode", "vfr"]
     if cfg["codec"] == "hevc_nvenc":
@@ -283,7 +302,7 @@ def fingerprint(source):
     return {"path": str(source.resolve()), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
 
 
-def validate_output(info, audio_count, expected_duration=None, video_codec="h264", pixel_format="yuv420p"):
+def validate_output(info, audio_count, expected_duration=None, video_codec="h264", pixel_format="yuv420p", resize=None):
     streams = info.get("streams", [])
     videos = [s for s in streams if s.get("codec_type") == "video"]
     audios = [s for s in streams if s.get("codec_type") == "audio"]
@@ -293,6 +312,11 @@ def validate_output(info, audio_count, expected_duration=None, video_codec="h264
         raise ValueError(f"Output pixel format is not {pixel_format}")
     if video_codec == "hevc" and videos[0].get("codec_tag_string") != "hvc1":
         raise ValueError("Output HEVC sample entry is not hvc1")
+    if resize is not None:
+        if (videos[0].get("width"), videos[0].get("height")) != tuple(resize):
+            raise ValueError(f"Output size does not match resize {resize[0]}x{resize[1]}")
+        if videos[0].get("sample_aspect_ratio") != "1:1":
+            raise ValueError("Resized output must have square pixels (SAR 1:1)")
     if len(audios) != audio_count or any(s.get("codec_name") != "aac" for s in audios):
         raise ValueError("Output AAC stream count mismatch")
     if any(str(s.get("sample_rate")) != "48000" for s in audios):
@@ -366,16 +390,18 @@ def encode_one(source, target, args, cfg, ffmpeg, ffprobe, *, supervisor=None):
     # Omit the default flag so completed jobs from earlier versions still match.
     if args.allow_input_errors:
         request["allow_input_errors"] = True
+    if args.resize is not None:
+        request["resize"] = list(args.resize)
     sidecar = target.with_suffix(".mp4.json")
     if target.exists():
         if not sidecar.exists() or read_json(sidecar).get("request") != request:
             raise ValueError(f"Existing output has no matching job record; choose another output directory: {target}")
-        validate_output(probe(ffprobe, target, runner=runner), len(audios), output_duration, output_codec, cfg["pix_fmt"])
+        validate_output(probe(ffprobe, target, runner=runner), len(audios), output_duration, output_codec, cfg["pix_fmt"], args.resize)
         status(f"SKIP {target}")
         return "skipped"
     partial = target.with_name(f".{target.stem}.{uuid.uuid4().hex}.partial.mp4")
     cmd = command(ffmpeg, source, partial, cfg, video, audios, args.start, args.duration,
-                  allow_input_errors=args.allow_input_errors)
+                  allow_input_errors=args.allow_input_errors, resize=args.resize)
     if args.allow_input_errors:
         status(f"WARNING {source}: Input error recovery enabled; inspect the log and picture/audio near damaged sections.",
                file=sys.stderr)
@@ -396,7 +422,7 @@ def encode_one(source, target, args, cfg, ffmpeg, ffprobe, *, supervisor=None):
             handle.write(f"\nSTAGE: {stage}\n")
             handle.flush()
             output = probe(ffprobe, partial, runner=runner)
-            validate_output(output, len(audios), output_duration, output_codec, cfg["pix_fmt"])
+            validate_output(output, len(audios), output_duration, output_codec, cfg["pix_fmt"], args.resize)
             if args.verify_full:
                 stage = "verify-full (decode output MP4)"
                 handle.write(f"\nSTAGE: {stage}\n")
@@ -439,6 +465,16 @@ def positive_int(value):
     return number
 
 
+def resize_size(value):
+    match = re.fullmatch(r"([0-9]+)[xX]([0-9]+)", value)
+    if not match:
+        raise argparse.ArgumentTypeError("resize must be WIDTHxHEIGHT, e.g. 1280x720")
+    size = tuple(int(part) for part in match.groups())
+    if any(dimension < 2 or dimension % 2 for dimension in size):
+        raise argparse.ArgumentTypeError("resize width and height must be even integers of at least 2")
+    return size
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["inspect", "encode"])
@@ -452,6 +488,8 @@ def main(argv=None):
     parser.add_argument("--program", type=int, help="TS service/program ID, as shown by inspect")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "output")
     parser.add_argument("--recursive", action="store_true")
+    parser.add_argument("--resize", type=resize_size, metavar="WIDTHxHEIGHT",
+                        help="fit after deinterlacing, preserving display aspect ratio with black padding and square pixels")
     parser.add_argument("--jobs", type=positive_int, default=1,
                         help="maximum simultaneous files, including probing and output verification (default: 1)")
     parser.add_argument("--min-age", type=finite_nonnegative, default=300,

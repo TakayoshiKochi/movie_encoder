@@ -7,6 +7,7 @@ param(
     [string]$Profile = 'hevc-nvenc',
     [int]$MinAge = 300,
     [ValidateRange(1, 2147483647)][int]$Jobs = 1,
+    [ValidatePattern('^[0-9]+[xX][0-9]+$')][string]$Resize,
     [int]$ProgramId = -1,
     [switch]$DryRun,
     [switch]$VerifyFull,
@@ -27,5 +28,6 @@ if ($ProgramId -ge 0) { $cliArgs += @('--program', "$ProgramId") }
 if ($DryRun) { $cliArgs += '--dry-run' }
 if ($VerifyFull) { $cliArgs += '--verify-full' }
 if ($AllowInputErrors) { $cliArgs += '--allow-input-errors' }
+if ($Resize) { $cliArgs += @('--resize', $Resize) }
 & $runner.Source @cliArgs
 exit $LASTEXITCODE

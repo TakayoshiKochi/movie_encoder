@@ -32,7 +32,7 @@ class EncodingTests(unittest.TestCase):
         self.source.write_bytes(b"original TS")
         self.target = self.root / "output" / "test.ts.mp4"
         self.args = argparse.Namespace(program=None, start=0, duration=None, verify_full=False, dry_run=False,
-                                       allow_input_errors=False)
+                                       allow_input_errors=False, resize=None)
 
     def run_job(self, probe=None, run=None):
         with patch("encode.probe", side_effect=probe or [INFO, OUTPUT]), \
@@ -63,6 +63,60 @@ class EncodingTests(unittest.TestCase):
         cmd = encode.command("ffmpeg", self.source, self.target, self.cfg, VIDEO, [])
         self.assertIn("-an", cmd)
         self.assertNotIn("-c:a", cmd)
+
+    def test_resize_dimensions_and_filter_order(self):
+        self.assertEqual(encode.resize_size("1280x720"), (1280, 720))
+        self.assertEqual(encode.resize_size("640X480"), (640, 480))
+        cmd = encode.command("ffmpeg", self.source, self.target, self.cfg, VIDEO, [AUDIO], resize=(1280, 720))
+        filters = cmd[cmd.index("-vf") + 1]
+        self.assertLess(filters.index("bwdif="), filters.index("scale="))
+        self.assertLess(filters.index("scale="), filters.index("setsar=1"))
+        self.assertLess(filters.index("setsar=1"), filters.index("pad="))
+        self.assertIn("720*dar", filters)
+        self.assertIn("1280/dar", filters)
+        self.assertIn("pad=1280:720", filters)
+        self.assertIn("color=black", filters)
+
+    def test_invalid_resize_rejected_before_launching_tools(self):
+        for value in ("1280", "1280:720", "0x720", "1279x720", "1280x719", "-2x720", "1280x720,setsar=2"):
+            with self.subTest(value=value), redirect_stderr(io.StringIO()), \
+                 patch("encode.executable") as launch, self.assertRaises(SystemExit) as error:
+                encode.main(["encode", str(self.source), "--resize", value])
+            self.assertEqual(error.exception.code, 2)
+            launch.assert_not_called()
+
+    def test_progressive_resize_and_unchanged_default(self):
+        cfg = encode.load_profile(encode.ROOT / "profiles.json", "hevc-progressive")
+        self.assertEqual(encode.video_filter(cfg), "")
+        filters = encode.video_filter(cfg, (1280, 720))
+        self.assertNotIn("bwdif", filters)
+        self.assertIn("scale=", filters)
+        self.assertIn("setsar=1", filters)
+
+    def test_resize_is_recorded_and_resume_matches_json(self):
+        self.args.resize = (1280, 720)
+        output = copy.deepcopy(OUTPUT)
+        output["streams"][0].update(width=1280, height=720, sample_aspect_ratio="1:1")
+        self.assertEqual(self.run_job(probe=[INFO, output]), "encoded")
+        record = encode.read_json(self.target.with_suffix(".mp4.json"))
+        self.assertEqual(record["request"]["resize"], [1280, 720])
+        self.assertEqual(self.run_job(probe=[INFO, output]), "skipped")
+        self.args.resize = (1920, 1080)
+        with self.assertRaisesRegex(ValueError, "no matching job record"):
+            self.run_job(probe=[INFO])
+        self.args.resize = None
+        with self.assertRaisesRegex(ValueError, "no matching job record"):
+            self.run_job(probe=[INFO])
+
+    def test_resize_rejects_wrong_size_or_pixel_aspect(self):
+        self.args.resize = (1280, 720)
+        for changes, message in (({"width": 960, "height": 720, "sample_aspect_ratio": "1:1"}, "size"),
+                                 ({"width": 1280, "height": 720, "sample_aspect_ratio": "4:3"}, "square pixels")):
+            output = copy.deepcopy(OUTPUT)
+            output["streams"][0].update(changes)
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, message):
+                self.run_job(probe=[INFO, output])
+            self.assertFalse(self.target.exists())
 
     def test_command_preserves_paths_and_field_rate(self):
         cmd = encode.command("ffmpeg", self.source, self.target, self.cfg, VIDEO, [AUDIO], 3, 5)
