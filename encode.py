@@ -528,15 +528,22 @@ def main(argv=None):
     counts = {"encoded": 0, "skipped": 0, "planned": 0, "pending": 0, "failed": 0}
 
     supervisor = ProcessSupervisor()
+    progress_lock = threading.Lock()
+    started_count = 0
+    total_count = len(jobs)
 
     def worker(job):
+        nonlocal started_count
         path, target = job
         try:
             supervisor.check_cancelled()
+            # Assign and print together so parallel workers cannot display 2 before 1.
+            with progress_lock:
+                started_count += 1
+                status(f"INPUT [{started_count}/{total_count}] {path}")
             if source.is_dir() and time.time() - path.stat().st_mtime < args.min_age:
                 status(f"PENDING (recently modified) {path}")
                 return "pending"
-            status(f"INPUT {path}")
             return encode_one(path, target, args, cfg, ffmpeg, ffprobe, supervisor=supervisor)
         except (OSError, ValueError, subprocess.CalledProcessError) as exc:
             status(f"FAILED {path}: {exc}", file=sys.stderr)

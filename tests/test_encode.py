@@ -416,6 +416,8 @@ class EncodingTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(peak, 2)
         self.assertCountEqual(visited, ["a.ts", "b.ts", "c.ts", "d.ts"])
+        starts = [line.split()[1] for line in output.getvalue().splitlines() if line.startswith("INPUT [")]
+        self.assertEqual(starts, ["[1/4]", "[2/4]", "[3/4]", "[4/4]"])
         counts = json.loads(output.getvalue().splitlines()[-1])
         self.assertEqual((counts["planned"], counts["failed"]), (3, 1))
 
