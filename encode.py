@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import math
 import os
@@ -475,6 +475,15 @@ def resize_size(value):
     return size
 
 
+def estimated_finish(started_at, elapsed, completed, total):
+    """Extrapolate observed batch throughput, already including parallel workers."""
+    if total == 0:
+        return started_at + timedelta(seconds=elapsed)
+    if completed == 0:
+        return None
+    return started_at + timedelta(seconds=elapsed * total / completed)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["inspect", "encode"])
@@ -530,7 +539,16 @@ def main(argv=None):
     supervisor = ProcessSupervisor()
     progress_lock = threading.Lock()
     started_count = 0
+    completed_count = 0
     total_count = len(jobs)
+    batch_started_at = None
+    batch_started_clock = 0.0
+
+    def progress_details():
+        elapsed = max(0.0, time.monotonic() - batch_started_clock)
+        finish = estimated_finish(batch_started_at, elapsed, completed_count, total_count)
+        eta = finish.isoformat(sep=" ", timespec="seconds") if finish else "calculating"
+        return f"elapsed={timedelta(seconds=int(elapsed))} | ETA={eta}"
 
     def worker(job):
         nonlocal started_count
@@ -540,7 +558,8 @@ def main(argv=None):
             # Assign and print together so parallel workers cannot display 2 before 1.
             with progress_lock:
                 started_count += 1
-                status(f"INPUT [{started_count}/{total_count}] {path}")
+                started_at = datetime.now().astimezone().isoformat(sep=" ", timespec="seconds")
+                status(f"INPUT [{started_count}/{total_count}] {path} | started={started_at} | {progress_details()}")
             if source.is_dir() and time.time() - path.stat().st_mtime < args.min_age:
                 status(f"PENDING (recently modified) {path}")
                 return "pending"
@@ -550,8 +569,19 @@ def main(argv=None):
             return "failed"
 
     def process():
+        nonlocal batch_started_at, batch_started_clock, completed_count
+        batch_started_at = datetime.now().astimezone()
+        batch_started_clock = time.monotonic()
+        mode = "dry-run" if args.dry_run else "encode"
+        status(f"BATCH START {batch_started_at.isoformat(sep=' ', timespec='seconds')}"
+               f" | files={total_count} jobs={args.jobs} mode={mode} | {progress_details()}")
         for result in run_jobs(jobs, worker, args.jobs, supervisor):
             counts[result] += 1
+            with progress_lock:
+                completed_count += 1
+                status(f"PROGRESS [{completed_count}/{total_count}] | {progress_details()}")
+        status(f"BATCH END {datetime.now().astimezone().isoformat(sep=' ', timespec='seconds')}"
+               f" | {progress_details()}")
         print(json.dumps(counts), flush=True)
         return 1 if counts["failed"] else 0
 

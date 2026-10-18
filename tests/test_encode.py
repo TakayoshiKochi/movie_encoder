@@ -2,6 +2,7 @@ import argparse
 import copy
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timedelta, timezone
 import io
 import json
 from pathlib import Path
@@ -418,8 +419,25 @@ class EncodingTests(unittest.TestCase):
         self.assertCountEqual(visited, ["a.ts", "b.ts", "c.ts", "d.ts"])
         starts = [line.split()[1] for line in output.getvalue().splitlines() if line.startswith("INPUT [")]
         self.assertEqual(starts, ["[1/4]", "[2/4]", "[3/4]", "[4/4]"])
+        lines = output.getvalue().splitlines()
+        self.assertTrue(lines[0].startswith("BATCH START "))
+        self.assertIn("ETA=calculating", lines[0])
+        progress = [line for line in lines if line.startswith("PROGRESS [")]
+        self.assertEqual([line.split()[1] for line in progress], ["[1/4]", "[2/4]", "[3/4]", "[4/4]"])
+        self.assertTrue(all("elapsed=" in line and "ETA=" in line and "calculating" not in line for line in progress))
+        self.assertTrue(any(line.startswith("BATCH END ") for line in lines))
         counts = json.loads(output.getvalue().splitlines()[-1])
         self.assertEqual((counts["planned"], counts["failed"]), (3, 1))
+
+    def test_finish_estimate_uses_wall_throughput_and_crosses_midnight(self):
+        started = datetime(2026, 10, 18, 23, 59, tzinfo=timezone(timedelta(hours=9)))
+        self.assertIsNone(encode.estimated_finish(started, 10, 0, 10))
+        # Two completed files in 30 wall-clock seconds: 10 files take ~150s,
+        # irrespective of the number of workers. Never divide by jobs a second time.
+        self.assertEqual(encode.estimated_finish(started, 30, 2, 10),
+                         datetime(2026, 10, 19, 0, 1, 30, tzinfo=started.tzinfo))
+        self.assertEqual(encode.estimated_finish(started, 100, 10, 10), started + timedelta(seconds=100))
+        self.assertEqual(encode.estimated_finish(started, 0, 0, 0), started)
 
     def test_invalid_jobs_rejected_before_launching_tools(self):
         for value in ("0", "-1", "1.5"):
