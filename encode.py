@@ -21,11 +21,60 @@ import uuid
 ROOT = Path(__file__).resolve().parent
 EXTENSIONS = {".ts", ".m2ts", ".mts"}
 PRINT_LOCK = threading.Lock()
+STATUS_COLORS = {
+    "header": "\033[1;35m",
+    "info": "\033[34m",
+    "progress": "\033[1;36m",
+    "success": "\033[32m",
+    "warning": "\033[1;33m",
+    "error": "\033[1;31m",
+    "muted": "\033[90m",
+}
+STATUS_STYLES = {
+    "BATCH": "header", "INPUT": "info", "PROGRESS": "progress", "DONE": "success",
+    "SKIP": "muted", "PENDING": "warning", "WARNING": "warning", "FAILED": "error",
+}
 
 
-def status(message, *, file=None):
+def enable_windows_ansi(stream):
+    """Enable virtual terminal processing on this console handle, if available."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        import msvcrt
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.GetConsoleMode.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel.GetConsoleMode.restype = wintypes.BOOL
+        kernel.SetConsoleMode.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        kernel.SetConsoleMode.restype = wintypes.BOOL
+        handle = msvcrt.get_osfhandle(stream.fileno())
+        mode = wintypes.DWORD()
+        if not kernel.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        return bool(mode.value & 0x0004 or kernel.SetConsoleMode(handle, mode.value | 0x0004))
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def supports_color(stream):
+    if os.environ.get("NO_COLOR") or os.environ.get("TERM", "").lower() == "dumb":
+        return False
+    try:
+        if not stream.isatty():
+            return False
+    except (AttributeError, OSError, ValueError):
+        return False
+    return os.name != "nt" or enable_windows_ansi(stream)
+
+
+def status(message, *, file=None, style=None):
+    stream = file if file is not None else sys.stdout
+    style = style or STATUS_STYLES.get(message.partition(" ")[0])
     with PRINT_LOCK:
-        print(message, file=file or sys.stdout, flush=True)
+        if style in STATUS_COLORS and supports_color(stream):
+            message = f"{STATUS_COLORS[style]}{message}\033[0m"
+        print(message, file=stream, flush=True)
 
 
 class ProcessSupervisor:
@@ -405,7 +454,7 @@ def encode_one(source, target, args, cfg, ffmpeg, ffprobe, *, supervisor=None):
     if args.allow_input_errors:
         status(f"WARNING {source}: Input error recovery enabled; inspect the log and picture/audio near damaged sections.",
                file=sys.stderr)
-    status(subprocess.list2cmdline(cmd))
+    status(subprocess.list2cmdline(cmd), style="muted")
     if args.dry_run:
         return "planned"
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -445,7 +494,7 @@ def encode_one(source, target, args, cfg, ffmpeg, ffprobe, *, supervisor=None):
         status(f"DONE {target} ({record['elapsed_seconds']}s)")
         return "encoded"
     except BaseException:
-        status(f"Job failed during {stage}. Log: {log}", file=sys.stderr)
+        status(f"Job failed during {stage}. Log: {log}", file=sys.stderr, style="error")
         raise
     finally:
         partial.unlink(missing_ok=True)
@@ -595,8 +644,8 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        print("Interrupted; source TS files were kept.", file=sys.stderr)
+        status("Interrupted; source TS files were kept.", file=sys.stderr, style="warning")
         sys.exit(130)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
-        print(f"ERROR: {error}", file=sys.stderr)
+        status(f"ERROR: {error}", file=sys.stderr, style="error")
         sys.exit(1)

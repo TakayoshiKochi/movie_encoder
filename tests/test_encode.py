@@ -5,6 +5,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import sys
@@ -13,6 +14,56 @@ import unittest
 from unittest.mock import patch
 
 import encode
+
+
+class ConsoleOutputTests(unittest.TestCase):
+    class Terminal(io.StringIO):
+        def isatty(self):
+            return True
+
+    def setUp(self):
+        self.environment = patch.dict(os.environ, {"TERM": "xterm-256color"}, clear=True)
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
+        windows_ansi = patch("encode.enable_windows_ansi", return_value=True)
+        windows_ansi.start()
+        self.addCleanup(windows_ansi.stop)
+
+    def test_terminal_statuses_and_command_have_distinct_colors_and_reset(self):
+        terminal = self.Terminal()
+        for message, style in (("PROGRESS [1/2]", "progress"), ("WARNING damaged input", "warning"),
+                               ("FAILED input.ts", "error"), ("DONE output.mp4", "success")):
+            encode.status(message, file=terminal)
+            self.assertIn(encode.STATUS_COLORS[style] + message + "\033[0m\n", terminal.getvalue())
+        encode.status("ffmpeg -i input.ts output.mp4", file=terminal, style="muted")
+        self.assertTrue(terminal.getvalue().endswith("\033[90mffmpeg -i input.ts output.mp4\033[0m\n"))
+
+    def test_redirected_output_never_contains_ansi(self):
+        stream = io.StringIO()
+        encode.status("PROGRESS [1/2]", file=stream)
+        encode.status("ffmpeg -i input.ts output.mp4", file=stream, style="muted")
+        self.assertEqual(stream.getvalue(), "PROGRESS [1/2]\nffmpeg -i input.ts output.mp4\n")
+
+    def test_no_color_and_dumb_terminal_disable_color(self):
+        for environment in ({"NO_COLOR": "1"}, {"TERM": "dumb"}):
+            with self.subTest(environment=environment), patch.dict(os.environ, environment):
+                terminal = self.Terminal()
+                encode.status("WARNING damaged input", file=terminal)
+                self.assertEqual(terminal.getvalue(), "WARNING damaged input\n")
+
+    def test_stdout_and_stderr_are_detected_separately(self):
+        terminal, redirected = self.Terminal(), io.StringIO()
+        with redirect_stdout(terminal), redirect_stderr(redirected):
+            encode.status("PROGRESS [1/2]")
+            encode.status("FAILED input.ts", file=sys.stderr)
+        self.assertIn("\033[", terminal.getvalue())
+        self.assertEqual(redirected.getvalue(), "FAILED input.ts\n")
+
+    def test_windows_console_without_ansi_support_uses_plain_text(self):
+        terminal = self.Terminal()
+        with patch("encode.os.name", "nt"), patch("encode.enable_windows_ansi", return_value=False):
+            encode.status("PROGRESS [1/2]", file=terminal)
+        self.assertEqual(terminal.getvalue(), "PROGRESS [1/2]\n")
 
 
 VIDEO = {"index": 2, "codec_type": "video", "codec_name": "mpeg2video", "duration": "10"}
