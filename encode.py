@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TS -> H.265 (x265/NVENC) or H.264 (x264) / AAC MP4. Python 3.10+, standard library only."""
+"""TS -> H.265 (x265/NVENC/AMF) or H.264 (x264) / AAC MP4. Python 3.10+, standard library only."""
 from __future__ import annotations
 
 import argparse
@@ -240,7 +240,7 @@ def select_streams(info, program=None, audio="all"):
     return videos[0], audios
 
 
-def load_profile(path, name, crf=None, cq=None):
+def load_profile(path, name, crf=None, cq=None, qp=None):
     profiles = read_json(path)
     if name not in profiles:
         raise ValueError(f"Unknown profile {name}; choose from {', '.join(profiles)}")
@@ -251,33 +251,41 @@ def load_profile(path, name, crf=None, cq=None):
     cfg.setdefault("x265_params", "")
     cfg.setdefault("audio_sample_rate", 48000)
     nvenc = cfg["codec"] == "hevc_nvenc"
+    amf = cfg["codec"] == "hevc_amf"
     required = {"preset", "tune", "deinterlace", "parity", "deint_frames",
                 "audio", "audio_bitrate", "surround_bitrate", "x264_params",
                 "codec", "pix_fmt", "x265_params", "audio_sample_rate"}
-    required |= {"cq", "nvenc"} if nvenc else {"crf"}
+    required |= {"cq", "nvenc"} if nvenc else {"qp"} if amf else {"crf"}
     if set(cfg) != required:
         raise ValueError(f"Profile keys must be: {', '.join(sorted(required))}")
-    if nvenc and crf is not None:
-        raise ValueError("NVENC uses --cq, not --crf; their quality scales are not equivalent")
+    if (nvenc or amf) and crf is not None:
+        raise ValueError("Hardware profiles use --cq (NVENC) or --qp (AMF), not --crf")
     if not nvenc and cq is not None:
-        raise ValueError("--cq requires a hevc_nvenc profile; use --crf for x264/x265")
-    quality_key = "cq" if nvenc else "crf"
-    override = cq if nvenc else crf
+        raise ValueError("--cq requires a hevc_nvenc profile")
+    if not amf and qp is not None:
+        raise ValueError("--qp requires a hevc_amf profile")
+    quality_key = "cq" if nvenc else "qp" if amf else "crf"
+    override = cq if nvenc else qp if amf else crf
     if override is not None:
         cfg[quality_key] = override
     value = cfg[quality_key]
     if (isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 51
             or (nvenc and value == 0)):
         raise ValueError(f"{quality_key} must be a number {'greater than 0 and up to 51' if nvenc else 'from 0 to 51'}")
-    if cfg["codec"] not in {"libx264", "libx265", "hevc_nvenc"}:
-        raise ValueError("codec must be libx264, libx265 or hevc_nvenc")
+    if amf and type(value) is not int:
+        raise ValueError("qp must be an integer from 0 to 51")
+    if cfg["codec"] not in {"libx264", "libx265", "hevc_nvenc", "hevc_amf"}:
+        raise ValueError("codec must be libx264, libx265, hevc_nvenc or hevc_amf")
     if cfg["pix_fmt"] not in ({"yuv420p", "yuv420p10le"} if cfg["codec"] == "libx265" else {"yuv420p"}):
         raise ValueError("Unsupported pixel format for the selected codec")
     presets = ({f"p{i}" for i in range(1, 8)} if nvenc else
+               {"speed", "balanced", "quality"} if amf else
                {"ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"})
     if cfg["preset"] not in presets:
         raise ValueError("Invalid encoder preset")
     tunes = {"hq", "ll", "ull"} if nvenc else {None, "animation", "grain", "fastdecode", "zerolatency", "psnr", "ssim"}
+    if amf:
+        tunes = {None}
     if cfg["codec"] == "libx264":
         tunes |= {"film", "stillimage"}
     if cfg["tune"] not in tunes:
@@ -359,9 +367,13 @@ def command(ffmpeg, source, target, cfg, video, audios, start=0, duration=None,
                  "-spatial-aq", str(int(options["spatial_aq"])),
                  "-temporal-aq", str(int(options["temporal_aq"])),
                  "-multipass", options["multipass"], "-bf", str(options["bframes"])]
+    elif cfg["codec"] == "hevc_amf":
+        # CQP uses separate I/P quantizers; VBAQ is unsupported in this mode.
+        args += ["-usage", "transcoding", "-rc", "cqp", "-qp_i", str(cfg["qp"]),
+                 "-qp_p", str(cfg["qp"]), "-vbaq", "0"]
     else:
         args += ["-crf", str(cfg["crf"])]
-    if cfg["codec"] in {"libx265", "hevc_nvenc"}:
+    if cfg["codec"] in {"libx265", "hevc_nvenc", "hevc_amf"}:
         args += ["-tag:v", "hvc1"]
     if cfg["tune"]:
         args += ["-tune", cfg["tune"]]
@@ -470,7 +482,7 @@ def encode_one(source, target, args, cfg, ffmpeg, ffprobe, *, supervisor=None):
     before = fingerprint(source)
     info = probe(ffprobe, source, runner=runner)
     video, audios = select_streams(info, args.program, cfg["audio"])
-    output_codec = "hevc" if cfg["codec"] in {"libx265", "hevc_nvenc"} else "h264"
+    output_codec = "hevc" if cfg["codec"] in {"libx265", "hevc_nvenc", "hevc_amf"} else "h264"
     output_duration = expected_duration(info, video, args.start, args.duration)
     request = {"source": before, "profile": cfg, "program": args.program,
                "start": args.start, "duration": args.duration, "verify_full": args.verify_full}
@@ -581,6 +593,7 @@ def main(argv=None):
     parser.add_argument("--profile", default="hevc-nvenc")
     parser.add_argument("--crf", type=float)
     parser.add_argument("--cq", type=float, help="NVENC target quality (greater than 0, up to 51); not equivalent to CRF")
+    parser.add_argument("--qp", type=int, help="AMF constant I/P quantizer (0 to 51); not equivalent to NVENC CQ or CRF")
     parser.add_argument("--program", type=int, help="TS service/program ID, as shown by inspect")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "output")
     parser.add_argument("--recursive", action="store_true")
@@ -609,7 +622,7 @@ def main(argv=None):
         print(json.dumps(probe(ffprobe, source), ensure_ascii=False, indent=2))
         return 0
     ffmpeg = executable(args.ffmpeg)
-    cfg = load_profile(args.config, args.profile, args.crf, args.cq)
+    cfg = load_profile(args.config, args.profile, args.crf, args.cq, args.qp)
     if source.is_file():
         files = [source]
     elif source.is_dir():

@@ -22,6 +22,22 @@
     "x264_params": "",
     "x265_params": ""
   },
+  "hevc-amf": {
+    "codec": "hevc_amf",
+    "pix_fmt": "yuv420p",
+    "qp": 24,
+    "preset": "quality",
+    "tune": null,
+    "deinterlace": "frame",
+    "parity": "auto",
+    "deint_frames": "interlaced",
+    "audio": "all",
+    "audio_bitrate": "192k",
+    "surround_bitrate": "384k",
+    "audio_sample_rate": 48000,
+    "x264_params": "",
+    "x265_params": ""
+  },
   "hevc-balanced": {
     "codec": "libx265",
     "pix_fmt": "yuv420p",

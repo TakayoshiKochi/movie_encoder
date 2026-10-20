@@ -21,6 +21,7 @@ def main():
     parser.add_argument("--ffmpeg", default="ffmpeg")
     parser.add_argument("--ffprobe", default="ffprobe")
     parser.add_argument("--nvenc", action="store_true", help="also require and test a working HEVC NVENC GPU")
+    parser.add_argument("--amf", action="store_true", help="also require HEVC AMF and use it for the parallel queue test")
     args = parser.parse_args()
     ffmpeg = encode.executable(args.ffmpeg)
     ffprobe = encode.executable(args.ffprobe)
@@ -51,6 +52,8 @@ def main():
                 ("tv-balanced", "h264", Fraction(60000, 1001))]
     if args.nvenc:
         profiles.append(("hevc-nvenc", "hevc", Fraction(30000, 1001)))
+    if args.amf:
+        profiles.append(("hevc-amf", "hevc", Fraction(30000, 1001)))
     for profile, codec, rate in profiles:
         output_dir = root / profile
         cli = ["encode", str(source), "--profile", profile, "--output-dir", str(output_dir),
@@ -116,7 +119,7 @@ def main():
         shutil.copyfile(source, queue / name)
     queue_output = root / "queue-output"
     queue_cli = ["encode", str(queue), "--output-dir", str(queue_output), "--min-age", "0",
-                 "--profile", "hevc-nvenc" if args.nvenc else "hevc-balanced",
+                 "--profile", "hevc-amf" if args.amf else "hevc-nvenc" if args.nvenc else "hevc-balanced",
                  "--ffmpeg", ffmpeg, "--ffprobe", ffprobe, "--verify-full"]
     assert encode.main(queue_cli + ["--jobs", "2"]) == 0
     intervals = []

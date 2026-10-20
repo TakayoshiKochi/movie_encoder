@@ -93,6 +93,20 @@ NVENCの初期値は `p6 / hq / VBR-CQ`、目標平均ビットレートを指�
 
 出力 `.mp4.json` の `encode_seconds` は、FFmpegによる入力デコード・シーク・フィルター・映像/音声エンコード・MP4出力までの時間で、後段の出力検査を含みません。`elapsed_seconds` は後段の検査を含む合計です。容量はMP4のファイルサイズで比較できます。先頭までの読み飛ばしや短い素材の起動コストも時間に含まれるため、エンコーダー単体の速度とは区別し、長めの同じ区間で比較してください。
 
+## AMD Radeon / Ryzen内蔵GPUでエンコードする
+
+AMDのAMFに対応するGPU・ドライバーと `hevc_amf` を含むFFmpegを使用します。Ryzen 9 9950X（Granite Ridge）の内蔵Radeonで動作確認しています。内蔵GPUをBIOSで有効にし、AMDのグラフィックスドライバーをインストールしてください。エンコーダーが利用できない場合は失敗として記録し、別のエンコーダーへ自動切替はしません。
+
+```powershell
+py -3 .\encode.py encode 'D:\Recordings\番組.ts' --profile hevc-amf --start 300 --duration 60 --output-dir '.\samples\amf-qp24' --verify-full
+py -3 .\encode.py encode 'D:\Recordings\番組.ts' --profile hevc-amf --qp 26 --start 300 --duration 60 --output-dir '.\samples\amf-qp26' --verify-full
+.\Run-Queue.ps1 -InputDirectory 'D:\Recordings\Completed' -OutputDirectory 'D:\Encoded-AMF' -Profile hevc-amf -Jobs 2 -VerifyFull -KeepAwake
+```
+
+`hevc-amf` は HEVC / yuv420p・8bit / preset=quality / usage=transcoding / CQP / I・PフレームのQP=24 を比較の初期値にします。CQPで非対応のVBAQは明示的に無効にしています。インターレース解除・リサイズ・音声は他のプロファイルと共通です。デコードとbwdifはCPUで処理し、映像エンコードをAMD GPUで行います。既定プロファイルは引き続き `hevc-nvenc` です。
+
+**AMFのCQPは固定量子化であり、NVENCのVBR-CQやx265のCRFとは異なります。QP24・CQ24・CRF24は同等画質を意味しません。** `--qp` はAMF専用の0～51の整数で、小さくすると高画質・大容量になる方向です。固定ビットレートや固定容量にはなりません。まず同じ区間で画質・容量・速度を比較して調整してください。AMFに `--cq` / `--crf`、他のプロファイルに `--qp` を指定するとエラーになります。PowerShellラッパーのQP変更はプロファイルを複製・編集して `-Profile` で選択します。
+
 ## 設定ファイル
 
 `profiles.json` を編集します。独自のプロファイルを複製して名前を付け、`--profile 名前` で選べます。別ファイルは `--config パス` で指定できます。
@@ -103,6 +117,7 @@ NVENCの初期値は `p6 / hq / VBR-CQ`、目標平均ビットレートを指�
 | `hevc-bob` | 22 / medium | bwdif、1 フィールド → 1 フレーム | HEVC、59.94p等で動きを優先する比較用 |
 | `hevc-progressive` | 22 / medium | 解除しない | HEVC、プログレッシブと確認できた素材 |
 | `hevc-nvenc`（初期値） | CQ 24 / p6 | bwdif、1 入力フレーム → 1 フレーム | HEVC、NVENC採用設定 |
+| `hevc-amf` | CQP 24 / quality | bwdif、1 入力フレーム → 1 フレーム | HEVC、AMD Radeon向け比較設定 |
 | `tv-balanced` | 20 / slow | bwdif、1 フィールド → 1 フレーム | H.264、動きを優先 |
 | `tv-small` | 23 / slow | bwdif、1 入力フレーム → 1 フレーム | H.264、容量優先 |
 | `progressive` | 20 / slow | 解除しない | H.264、プログレッシブ素材 |
@@ -111,11 +126,12 @@ NVENCの初期値は `p6 / hq / VBR-CQ`、目標平均ビットレートを指�
 
 | キー | 変更の目安 |
 |---|---|
-| `codec` | `libx265` / `hevc_nvenc` = HEVC、`libx264` = H.264。省略時は旧設定互換のため libx264 |
-| `pix_fmt` | libx265は `yuv420p`（8bit）または `yuv420p10le`（10bit）。省略時8bit。NVENC/H.264はこのスクリプトでは8bitのみ |
+| `codec` | `libx265` / `hevc_nvenc` / `hevc_amf` = HEVC、`libx264` = H.264。省略時は旧設定互換のため libx264 |
+| `pix_fmt` | libx265は `yuv420p`（8bit）または `yuv420p10le`（10bit）。省略時8bit。NVENC/AMF/H.264はこのスクリプトでは8bitのみ |
 | `crf` | 小さいほど高画質・大容量の傾向。HEVCはまず 20 / 22 / 24 を比較。`--crf` で一時上書き可能。x264とx265の同じCRF値は同等画質を意味しない |
 | `preset` | 速度と圧縮効率の調整。HEVCはmediumから開始し、余裕があればslowを比較。CRFを固定しても容量・画質は完全には一致しない |
 | `cq` | NVENC専用。0より大きく51以下。`--cq`で上書き。NVENCプロファイルにはcrfを入れない |
+| `qp` | AMF専用。0～51の整数。`--qp`で上書き。AMFプロファイルにはcrf・cq・nvencを入れない。presetはspeed/balanced/quality、tuneはnull、ピクセル形式はyuv420pのみ |
 | `nvenc` | NVENC専用の設定オブジェクト。`lookahead`（0～32）、`spatial_aq` / `temporal_aq`（真偽値）、`multipass`（disabled/qres/fullres）、`bframes`（0～4）。presetはp1～p7 |
 | `tune` | x265の混在素材は `null`。必要なら `animation` / `grain` を比較。`film` はlibx264のみで使用可。NVENCはhq/ll/ullから選ぶ |
 | `deinterlace` | `bob` / `frame` / `off` |
@@ -273,6 +289,14 @@ py -3 .\tests\smoke_ffmpeg.py --ffmpeg 'C:\ProgramData\chocolatey\bin\ffmpeg.exe
 対応GPUがある場合は、このコマンドに `--nvenc` を追加するとNVENCの変換・全体デコード・入力fps/形式/音声/SAR・再開も検査します。`--nvenc` でNVENCが利用できない場合は検査失敗になり、スキップはしません。レポートには各MP4のサイズとエンコード段階の処理時間も記録します。6秒の人工素材は動作確認用であり、実番組の画質・容量・速度を代表するベンチマークではありません。
 
 同じ動作確認では、3本の人工TSを `--jobs 2` で同じ出力フォルダーへ変換し、処理時間の重なり・出力検査・`--jobs 1`での再開・不正な入力を含む場合の終了コードも検証します。2026-10-17、RTX 5080 / FFmpeg 9.0.2 / NVENC CQ24で、この並列変換を含む動作確認が成功しました。
+
+`--amf` を追加するとAMD AMFの変換・全体デコード・fps/SAR/音声・再開を検査し、並列キュー検査にもAMFを使用します。`--nvenc` と併用すれば両方の単体変換を検査できます。対応GPU・ドライバーが必要で、利用できない場合は検査失敗になります。
+
+```powershell
+py -3 .\tests\smoke_ffmpeg.py --amf --nvenc --ffmpeg 'C:\ProgramData\chocolatey\bin\ffmpeg.exe' --ffprobe 'C:\ProgramData\chocolatey\bin\ffprobe.exe'
+```
+
+2026-10-20、Ryzen 9 9950X内蔵Radeon / AMDドライバー32.0.21030.2001 / FFmpeg 9.0.2でAMFの単体・2並列検査が成功しました。別途30秒の人工1440×1080インターレースTS（SAR 4:3）でQP24・QP26、1280×720へのリサイズ、全体デコード、再開も成功しました。同じ人工素材ではAMF QP24が3.36秒・34.65MB、AMF QP26が2.77秒・28.47MB、RTX 5080のNVENC CQ24が5.61秒・29.27MBでした。時間はエンコード段階のみ、容量は10進MBです。品質設定・方式が異なるため同等画質での性能比較ではなく、実番組を代表するものでもありません。生成物とレポートは `samples/amf-hd-20261020-114738/` に保存しています。
 
 2026-10-16、GeForce RTX 5080 / NVIDIA Driver 617.42 / FFmpeg 9.0.2 で `--nvenc` を含む動作確認が成功しました。NVENCでもHEVC・YUV 4:2:0 8bit・約29.97p・SAR保持・AAC 48kHzの2音声・全体デコード・再開を確認しています。
 

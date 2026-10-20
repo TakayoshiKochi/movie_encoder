@@ -302,6 +302,46 @@ class EncodingTests(unittest.TestCase):
         self.assertEqual(record["request"]["profile"]["cq"], 24)
         self.assertEqual(self.run_job(probe=[INFO, self.hevc_output()]), "skipped")
 
+    def test_amf_command_uses_cqp_and_shared_filters(self):
+        cfg = encode.load_profile(encode.ROOT / "profiles.json", "hevc-amf", qp=26)
+        cmd = encode.command("ffmpeg", self.source, self.target, cfg, VIDEO, [AUDIO], resize=(1280, 720))
+        for flag, value in (("-c:v", "hevc_amf"), ("-rc", "cqp"), ("-qp_i", "26"),
+                            ("-qp_p", "26"), ("-usage", "transcoding"), ("-vbaq", "0"),
+                            ("-preset", "quality"), ("-tag:v", "hvc1"), ("-pix_fmt", "yuv420p"),
+                            ("-ar", "48000"), ("-b:a:0", "192k")):
+            self.assertEqual(cmd[cmd.index(flag) + 1], value)
+        self.assertEqual(cmd[cmd.index("-vf") + 1], encode.video_filter(cfg, (1280, 720)))
+        for flag in ("-crf", "-cq", "-tune", "-rc-lookahead", "-hwaccel", "-x265-params", "-bf"):
+            self.assertNotIn(flag, cmd)
+
+    def test_amf_publish_resume_and_quality_change(self):
+        self.cfg = encode.load_profile(encode.ROOT / "profiles.json", "hevc-amf")
+        self.assertEqual(self.run_job(probe=[INFO, self.hevc_output()]), "encoded")
+        record = encode.read_json(self.target.with_suffix(".mp4.json"))
+        self.assertEqual(record["request"]["profile"]["qp"], 24)
+        self.assertEqual(self.run_job(probe=[INFO, self.hevc_output()]), "skipped")
+        self.cfg["qp"] = 26
+        with self.assertRaisesRegex(ValueError, "no matching job record"):
+            self.run_job(probe=[INFO])
+
+    def test_amf_rejects_other_quality_scales_and_invalid_qp(self):
+        for kwargs in ({"crf": 22}, {"cq": 24}, {"qp": -1}, {"qp": 52},
+                       {"qp": True}, {"qp": 24.5}, {"qp": float("nan")}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                encode.load_profile(encode.ROOT / "profiles.json", "hevc-amf", **kwargs)
+        for profile in ("hevc-balanced", "hevc-nvenc"):
+            with self.assertRaisesRegex(ValueError, "requires a hevc_amf"):
+                encode.load_profile(encode.ROOT / "profiles.json", profile, qp=24)
+
+    def test_amf_rejects_unsupported_profile_options(self):
+        cfg = encode.load_profile(encode.ROOT / "profiles.json", "hevc-amf")
+        config = self.root / "amf.json"
+        for change in ({"preset": "p6"}, {"tune": "hq"}, {"cq": 24}, {"crf": 22},
+                       {"pix_fmt": "yuv420p10le"}, {"x265_params": "aq-mode=3"}):
+            encode.write_json(config, {"test": {**cfg, **change}})
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                encode.load_profile(config, "test")
+
     def test_crf_and_cq_cannot_be_mixed(self):
         for profile, kwargs in (("hevc-nvenc", {"crf": 22}), ("hevc-balanced", {"cq": 22})):
             with self.assertRaises(ValueError):
