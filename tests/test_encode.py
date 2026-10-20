@@ -16,6 +16,61 @@ from unittest.mock import patch
 import encode
 
 
+class KeepAwakeTests(unittest.TestCase):
+    def test_restores_prior_requirements_after_success_error_or_interrupt(self):
+        for error in (None, ValueError("bad encode"), KeyboardInterrupt()):
+            with self.subTest(error=error), patch("encode.sys.platform", "win32"), \
+                 patch("encode.windows_execution_state") as load, redirect_stdout(io.StringIO()):
+                setter = load.return_value
+                # Preserve an existing display requirement on this thread as well.
+                setter.return_value = 0x80000002
+                def run():
+                    with encode.keep_awake(True):
+                        setter.assert_called_once_with(0x80000001)
+                        if error is not None:
+                            raise error
+                if error is None:
+                    run()
+                else:
+                    with self.assertRaises(type(error)):
+                        run()
+                self.assertEqual([call.args[0] for call in setter.call_args_list],
+                                 [0x80000001, 0x80000002])
+
+    def test_disabled_does_not_load_windows_api(self):
+        with patch("encode.windows_execution_state") as load:
+            with encode.keep_awake(False):
+                pass
+            load.assert_not_called()
+
+    def test_acquisition_failure_does_not_start_work(self):
+        with patch("encode.sys.platform", "win32"), \
+             patch("encode.windows_execution_state") as load:
+            load.return_value.return_value = 0
+            with self.assertRaisesRegex(OSError, "Could not prevent"):
+                with encode.keep_awake(True):
+                    self.fail("work started without sleep inhibition")
+            load.return_value.assert_called_once_with(0x80000001)
+
+    def test_release_failure_warns_and_preserves_original_exception(self):
+        output = io.StringIO()
+        with patch("encode.sys.platform", "win32"), \
+             patch("encode.windows_execution_state") as load, \
+             redirect_stdout(io.StringIO()), redirect_stderr(output):
+            load.return_value.side_effect = [0x80000000, 0]
+            with self.assertRaisesRegex(ValueError, "original"):
+                with encode.keep_awake(True):
+                    raise ValueError("original")
+        self.assertIn("WARNING could not restore", output.getvalue())
+
+    def test_non_windows_rejected_without_loading_api(self):
+        with patch("encode.sys.platform", "linux"), patch("encode.windows_execution_state") as load:
+            with self.assertRaisesRegex(ValueError, "requires Windows"):
+                with encode.keep_awake(True):
+                    self.fail("unsupported platform")
+            load.assert_not_called()
+
+
 class ConsoleOutputTests(unittest.TestCase):
     class Terminal(io.StringIO):
         def isatty(self):
@@ -424,6 +479,49 @@ class EncodingTests(unittest.TestCase):
                     self.fail("second writer acquired lock")
         with encode.output_lock(self.root):
             pass
+
+    def test_keep_awake_covers_all_parallel_jobs_and_is_released(self):
+        inputs = self.root / "awake-input"
+        inputs.mkdir()
+        for name in ("a.ts", "b.ts"):
+            (inputs / name).write_bytes(b"TS")
+        caller_thread = threading.get_ident()
+        events = []
+        barrier = threading.Barrier(2)
+
+        def set_state(flags):
+            self.assertEqual(threading.get_ident(), caller_thread)
+            events.append(flags)
+            return 0x80000000
+
+        def job(*args, **kwargs):
+            self.assertEqual(events, [0x80000001])
+            barrier.wait(timeout=5)
+            return "encoded"
+
+        with patch("encode.sys.platform", "win32"), \
+             patch("encode.windows_execution_state", return_value=set_state), \
+             patch("encode.executable", side_effect=lambda name: name), \
+             patch("encode.encode_one", side_effect=job) as work, redirect_stdout(io.StringIO()):
+            code = encode.main(["encode", str(inputs), "--output-dir", str(self.root / "awake-out"),
+                                "--min-age", "0", "--jobs", "2", "--verify-full", "--keep-awake"])
+        self.assertEqual(code, 0)
+        self.assertEqual(work.call_count, 2)
+        self.assertEqual(events, [0x80000001, 0x80000000])
+
+    def test_keep_awake_ignored_for_inspect_dry_run_and_empty_batch(self):
+        empty = self.root / "empty"
+        empty.mkdir()
+        cases = [["inspect", str(self.source)],
+                 ["encode", str(self.source), "--dry-run"],
+                 ["encode", str(empty), "--output-dir", str(self.root / "empty-out")]]
+        with patch("encode.windows_execution_state") as load, \
+             patch("encode.executable", side_effect=lambda name: name), \
+             patch("encode.probe", return_value={}), patch("encode.encode_one", return_value="planned"), \
+             redirect_stdout(io.StringIO()):
+            for argv in cases:
+                self.assertEqual(encode.main(argv + ["--keep-awake"]), 0)
+            load.assert_not_called()
 
     def test_batch_continues_after_a_failed_job(self):
         inputs = self.root / "input"

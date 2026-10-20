@@ -11,6 +11,7 @@ param(
     [int]$ProgramId = -1,
     [switch]$DryRun,
     [switch]$VerifyFull,
+    [switch]$KeepAwake,
     [switch]$AllowInputErrors
 )
 $ErrorActionPreference = 'Stop'
@@ -27,6 +28,7 @@ $cliArgs += @((Join-Path $PSScriptRoot 'encode.py'), 'encode', $InputDirectory,
 if ($ProgramId -ge 0) { $cliArgs += @('--program', "$ProgramId") }
 if ($DryRun) { $cliArgs += '--dry-run' }
 if ($VerifyFull) { $cliArgs += '--verify-full' }
+if ($KeepAwake) { $cliArgs += '--keep-awake' }
 if ($AllowInputErrors) { $cliArgs += '--allow-input-errors' }
 if ($Resize) { $cliArgs += @('--resize', $Resize) }
 & $runner.Source @cliArgs

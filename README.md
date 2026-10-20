@@ -189,6 +189,17 @@ py -3 .\encode.py encode 'D:\Recordings\Completed' --output-dir 'D:\Encoded' --r
 
 既定では、変換時に FFmpeg の `-xerror` を使い、エラーを検出したときは処理を失敗させます。`--verify-full` の有無に関係なく入力TSのデコードエラーで停止します。ログには `STAGE: encode input`、`STAGE: probe and validate output`、`STAGE: verify-full (decode output MP4)` を記録し、失敗時も段階を表示します。
 
+### 処理中の自動スリープを防ぐ（Windows）
+
+```powershell
+py -3 .\encode.py encode 'D:\Recordings\Completed' --recursive --output-dir 'D:\Encoded' --jobs 2 --verify-full --keep-awake
+.\Run-Queue.ps1 -InputDirectory 'D:\Recordings\Completed' -OutputDirectory 'D:\Encoded' -Jobs 2 -VerifyFull -KeepAwake
+```
+
+`--keep-awake`（PowerShellでは `-KeepAwake`）を付けると、バッチの入力解析・エンコード・出力検査中はWindowsの自動スリープを抑止します。並列処理にも対応し、完了・エラー・Ctrl+Cでの中断時に元の状態へ戻します。電源プランの設定変更や追加パッケージ、管理者権限は不要です。画面の消灯は許可します。指定を省略した場合は従来どおりです。
+
+[WindowsのSetThreadExecutionState API](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-setthreadexecutionstate) を使用します。手動でのスリープや、ノートPCの蓋を閉じる操作によるスリープは防ぎません。抑止に失敗した場合はエラーとして処理開始前に停止します。`inspect`・`--dry-run`・入力0件の場合は抑止しません。Windows以外で実処理に指定するとエラーになります。
+
 ### 2並列で処理する
 
 ```powershell

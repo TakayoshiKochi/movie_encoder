@@ -77,6 +77,44 @@ def status(message, *, file=None, style=None):
         print(message, file=stream, flush=True)
 
 
+def windows_execution_state():
+    """Load the thread-scoped Windows sleep inhibition API."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    setter = kernel.SetThreadExecutionState
+    setter.argtypes = (wintypes.DWORD,)
+    setter.restype = wintypes.DWORD
+    return setter
+
+
+@contextmanager
+def keep_awake(enabled):
+    """Acquire and restore sleep requirements on the batch's calling thread."""
+    if not enabled:
+        yield
+        return
+    if sys.platform != "win32":
+        raise ValueError("--keep-awake requires Windows")
+    continuous = 0x80000000
+    system_required = 0x00000001
+    setter = windows_execution_state()
+    previous = setter(continuous | system_required)
+    if not previous:
+        raise OSError("Could not prevent automatic sleep (SetThreadExecutionState failed)")
+    try:
+        status("POWER automatic sleep prevented; display may turn off", style="info")
+        yield
+    finally:
+        # Restore this thread's previous requirements, including when interrupted.
+        if setter(continuous | previous):
+            status("POWER previous sleep requirements restored", style="info")
+        else:
+            status("WARNING could not restore sleep requirements (SetThreadExecutionState failed)",
+                   file=sys.stderr)
+
+
 class ProcessSupervisor:
     """Track this batch's FFmpeg/ffprobe children, including during cancellation."""
 
@@ -556,6 +594,8 @@ def main(argv=None):
     parser.add_argument("--duration", type=finite_nonnegative)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--verify-full", action="store_true")
+    parser.add_argument("--keep-awake", action="store_true",
+                        help="prevent Windows automatic sleep throughout encoding and verification; ignored for inspect/dry-run")
     parser.add_argument("--allow-input-errors", action="store_true",
                         help="allow FFmpeg's normal input error recovery; output validation remains strict")
     args = parser.parse_args(argv)
@@ -636,7 +676,7 @@ def main(argv=None):
 
     if args.dry_run:
         return process()
-    with output_lock(destination):
+    with output_lock(destination), keep_awake(args.keep_awake and bool(jobs)):
         return process()
 
 
