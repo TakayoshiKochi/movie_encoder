@@ -574,6 +574,45 @@ class EncodingTests(unittest.TestCase):
             self.assertEqual(encode.main(argv), 1)
             self.assertEqual(job.call_count, 2)
 
+    def test_failure_summary_preserves_message_and_uses_color_only_on_terminal(self):
+        inputs = self.root / "summary-input"
+        inputs.mkdir()
+        failed = inputs / "bad.ts"
+        failed.write_bytes(b"bad")
+        (inputs / "good.ts").write_bytes(b"good")
+        message = "Multiple video programs [181, 182, 183]; select --program explicitly."
+        for terminal in (False, True):
+            stderr = ConsoleOutputTests.Terminal() if terminal else io.StringIO()
+            stdout = io.StringIO()
+            with self.subTest(terminal=terminal), \
+                 patch.dict(os.environ, {"TERM": "xterm"}, clear=True), \
+                 patch("encode.enable_windows_ansi", return_value=True), \
+                 patch("encode.executable", side_effect=lambda name: name), \
+                 patch("encode.encode_one", side_effect=[ValueError(message), "planned"]), \
+                 redirect_stdout(stdout), redirect_stderr(stderr):
+                code = encode.main(["encode", str(inputs), "--dry-run", "--min-age", "0"])
+            self.assertEqual(code, 1)
+            summary = f"FAILED FILES (1)\n  [1/1] {failed}\n    {message}\n"
+            if terminal:
+                red = encode.STATUS_COLORS["error"]
+                self.assertIn(red + "FAILED FILES (1)\033[0m\n", stderr.getvalue())
+                self.assertIn(f"{red}  [1/1] {failed}\n    {message}\033[0m\n", stderr.getvalue())
+            else:
+                self.assertTrue(stderr.getvalue().endswith(summary))
+                self.assertNotIn("\033[", stderr.getvalue())
+            self.assertEqual(stderr.getvalue().count(message), 2)
+            self.assertNotIn("FAILED FILES", stdout.getvalue())
+            self.assertEqual(json.loads(stdout.getvalue().splitlines()[-1])["failed"], 1)
+
+    def test_successful_batch_has_no_failure_summary(self):
+        output, errors = io.StringIO(), io.StringIO()
+        with patch("encode.executable", side_effect=lambda name: name), \
+             patch("encode.encode_one", return_value="planned"), \
+             redirect_stdout(output), redirect_stderr(errors):
+            self.assertEqual(encode.main(["encode", str(self.source), "--dry-run"]), 0)
+        self.assertEqual(errors.getvalue(), "")
+        self.assertNotIn("FAILED FILES", output.getvalue())
+
     def test_parallel_batch_respects_limit_and_continues_after_failure(self):
         inputs = self.root / "queue"
         inputs.mkdir()
@@ -594,14 +633,16 @@ class EncodingTests(unittest.TestCase):
                 barrier.wait(timeout=5)
                 if path.name == "a.ts":
                     raise ValueError("bad TS")
+                if path.name == "c.ts":
+                    raise OSError("cannot read TS")
                 return "planned"
             finally:
                 with lock:
                     active -= 1
 
-        output = io.StringIO()
+        output, errors = io.StringIO(), io.StringIO()
         with patch("encode.executable", side_effect=lambda name: name), \
-             patch("encode.encode_one", side_effect=job), redirect_stdout(output):
+             patch("encode.encode_one", side_effect=job), redirect_stdout(output), redirect_stderr(errors):
             code = encode.main(["encode", str(inputs), "--jobs", "2", "--min-age", "0", "--dry-run"])
         self.assertEqual(code, 1)
         self.assertEqual(peak, 2)
@@ -616,7 +657,10 @@ class EncodingTests(unittest.TestCase):
         self.assertTrue(all("elapsed=" in line and "ETA=" in line and "calculating" not in line for line in progress))
         self.assertTrue(any(line.startswith("BATCH END ") for line in lines))
         counts = json.loads(output.getvalue().splitlines()[-1])
-        self.assertEqual((counts["planned"], counts["failed"]), (3, 1))
+        self.assertEqual((counts["planned"], counts["failed"]), (2, 2))
+        summary = errors.getvalue().split("FAILED FILES (2)\n", 1)[1]
+        self.assertEqual(summary, f"  [1/2] {inputs / 'a.ts'}\n    bad TS\n"
+                                 f"  [2/2] {inputs / 'c.ts'}\n    cannot read TS\n")
 
     def test_finish_estimate_uses_wall_throughput_and_crosses_midnight(self):
         started = datetime(2026, 10, 18, 23, 59, tzinfo=timezone(timedelta(hours=9)))

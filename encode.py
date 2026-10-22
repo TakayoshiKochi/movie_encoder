@@ -637,6 +637,7 @@ def main(argv=None):
     if not args.dry_run:
         destination.mkdir(parents=True, exist_ok=True)
     counts = {"encoded": 0, "skipped": 0, "planned": 0, "pending": 0, "failed": 0}
+    failures = []
 
     supervisor = ProcessSupervisor()
     progress_lock = threading.Lock()
@@ -667,7 +668,10 @@ def main(argv=None):
                 return "pending"
             return encode_one(path, target, args, cfg, ffmpeg, ffprobe, supervisor=supervisor)
         except (OSError, ValueError, subprocess.CalledProcessError) as exc:
-            status(f"FAILED {path}: {exc}", file=sys.stderr)
+            message = str(exc) or type(exc).__name__
+            with progress_lock:
+                failures.append((path, message))
+            status(f"FAILED {path}: {message}", file=sys.stderr)
             return "failed"
 
     def process():
@@ -684,6 +688,10 @@ def main(argv=None):
                 status(f"PROGRESS [{completed_count}/{total_count}] | {progress_details()}")
         status(f"BATCH END {datetime.now().astimezone().isoformat(sep=' ', timespec='seconds')}"
                f" | {progress_details()}")
+        if failures:
+            status(f"FAILED FILES ({len(failures)})", file=sys.stderr, style="error")
+            for index, (path, message) in enumerate(sorted(failures, key=lambda item: str(item[0])), 1):
+                status(f"  [{index}/{len(failures)}] {path}\n    {message}", file=sys.stderr, style="error")
         print(json.dumps(counts), flush=True)
         return 1 if counts["failed"] else 0
 
