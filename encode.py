@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
 import json
 import math
@@ -17,6 +17,8 @@ import sys
 import threading
 import time
 import uuid
+
+import super_resolution
 
 ROOT = Path(__file__).resolve().parent
 EXTENSIONS = {".ts", ".m2ts", ".mts"}
@@ -491,11 +493,16 @@ def encode_one(source, target, args, cfg, ffmpeg, ffprobe, *, supervisor=None):
         request["allow_input_errors"] = True
     if args.resize is not None:
         request["resize"] = list(args.resize)
+    sr_options = getattr(args, "sr_options", None)
+    output_size = args.resize
+    if sr_options:
+        request["super_resolution"] = sr_options
+        output_size = args.resize or super_resolution.output_size(video, sr_options["scale"])
     sidecar = target.with_suffix(".mp4.json")
     if target.exists():
         if not sidecar.exists() or read_json(sidecar).get("request") != request:
             raise ValueError(f"Existing output has no matching job record; choose another output directory: {target}")
-        validate_output(probe(ffprobe, target, runner=runner), len(audios), output_duration, output_codec, cfg["pix_fmt"], args.resize)
+        validate_output(probe(ffprobe, target, runner=runner), len(audios), output_duration, output_codec, cfg["pix_fmt"], output_size)
         status(f"SKIP {target}")
         return "skipped"
     partial = target.with_name(f".{target.stem}.{uuid.uuid4().hex}.partial.mp4")
@@ -504,7 +511,10 @@ def encode_one(source, target, args, cfg, ffmpeg, ffprobe, *, supervisor=None):
     if args.allow_input_errors:
         status(f"WARNING {source}: Input error recovery enabled; inspect the log and picture/audio near damaged sections.",
                file=sys.stderr)
-    status(subprocess.list2cmdline(cmd), style="muted")
+    if sr_options:
+        status(f"SUPERRES {sr_options['model']} x{sr_options['scale']} -> {output_size[0]}x{output_size[1]}", style="progress")
+    else:
+        status(subprocess.list2cmdline(cmd), style="muted")
     if args.dry_run:
         return "planned"
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -512,7 +522,16 @@ def encode_one(source, target, args, cfg, ffmpeg, ffprobe, *, supervisor=None):
     started = time.monotonic()
     stage = "encode input"
     try:
-        with log.open("w", encoding="utf-8") as handle:
+        with log.open("w", encoding="utf-8") as handle, ExitStack() as stages:
+            prepared = None
+            if sr_options:
+                stage = "Real-ESRGAN super-resolution"
+                prepared = stages.enter_context(super_resolution.prepare(
+                    source, args, cfg, video, audios, ffmpeg, ffprobe, sr_options,
+                    runner=runner, probe=probe, status=status, log=handle, workspace_parent=target.parent))
+                cmd = super_resolution.final_command(command, ffmpeg, partial, cfg, prepared, args.resize)
+                status(subprocess.list2cmdline(cmd), style="muted")
+                stage = "encode enhanced frames"
             handle.write(f"STAGE: {stage}\n" + subprocess.list2cmdline(cmd) + "\n")
             handle.flush()
             runner(cmd, stdout=handle, stderr=subprocess.STDOUT, check=True)
@@ -521,7 +540,9 @@ def encode_one(source, target, args, cfg, ffmpeg, ffprobe, *, supervisor=None):
             handle.write(f"\nSTAGE: {stage}\n")
             handle.flush()
             output = probe(ffprobe, partial, runner=runner)
-            validate_output(output, len(audios), output_duration, output_codec, cfg["pix_fmt"], args.resize)
+            validate_output(output, len(audios), output_duration, output_codec, cfg["pix_fmt"], output_size)
+            if prepared:
+                super_resolution.verify_timing(ffprobe, partial, prepared, runner)
             if args.verify_full:
                 stage = "verify-full (decode output MP4)"
                 handle.write(f"\nSTAGE: {stage}\n")
@@ -538,6 +559,8 @@ def encode_one(source, target, args, cfg, ffmpeg, ffprobe, *, supervisor=None):
                   "encode_seconds": encode_seconds,
                   "elapsed_seconds": round(time.monotonic() - started, 2),
                   "completed_at": datetime.now(timezone.utc).isoformat(), "log": str(log)}
+        if prepared:
+            record["super_resolution"] = {"frames": prepared["frames"], "timing_verified": True}
         # Write the record before publishing; an interrupted job cannot be mistaken for a complete MP4.
         write_json(sidecar, record)
         publish(partial, target)
@@ -599,6 +622,14 @@ def main(argv=None):
     parser.add_argument("--recursive", action="store_true")
     parser.add_argument("--resize", type=resize_size, metavar="WIDTHxHEIGHT",
                         help="fit after deinterlacing, preserving display aspect ratio with black padding and square pixels")
+    parser.add_argument("--super-resolution", action="store_true", help="enable Real-ESRGAN ncnn Vulkan (8-bit HEVC only)")
+    parser.add_argument("--sr-exe", type=Path, default=ROOT / "tools" / "realesrgan" / "realesrgan-ncnn-vulkan.exe")
+    parser.add_argument("--sr-model-dir", type=Path, help="model directory (default: models beside sr-exe)")
+    parser.add_argument("--sr-model", choices=sorted(super_resolution.MODELS), default="realesrgan-x4plus")
+    parser.add_argument("--sr-scale", type=int, choices=[2, 3, 4], default=4)
+    parser.add_argument("--sr-tile", type=int, default=128, help="tile size, 0=auto; default 128")
+    parser.add_argument("--sr-gpu", type=int, help="Vulkan GPU index; default automatic")
+    parser.add_argument("--sr-work-dir", type=Path, help="temporary PNG/FFV1 workspace parent; default output folder")
     parser.add_argument("--jobs", type=positive_int, default=1,
                         help="maximum simultaneous files, including probing and output verification (default: 1)")
     parser.add_argument("--min-age", type=finite_nonnegative, default=300,
@@ -623,6 +654,7 @@ def main(argv=None):
         return 0
     ffmpeg = executable(args.ffmpeg)
     cfg = load_profile(args.config, args.profile, args.crf, args.cq, args.qp)
+    args.sr_options = super_resolution.configure(args, cfg, executable)
     if source.is_file():
         files = [source]
     elif source.is_dir():

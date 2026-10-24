@@ -93,6 +93,59 @@ NVENCの初期値は `p6 / hq / VBR-CQ`、目標平均ビットレートを指�
 
 出力 `.mp4.json` の `encode_seconds` は、FFmpegによる入力デコード・シーク・フィルター・映像/音声エンコード・MP4出力までの時間で、後段の出力検査を含みません。`elapsed_seconds` は後段の検査を含む合計です。容量はMP4のファイルサイズで比較できます。先頭までの読み飛ばしや短い素材の起動コストも時間に含まれるため、エンコーダー単体の速度とは区別し、長めの同じ区間で比較してください。
 
+## Real-ESRGANで超解像する
+
+`--super-resolution` で Real-ESRGAN ncnn Vulkan を有効にします。通常の `--resize` は補間拡大ですが、このオプションは学習済みモデルで映像を精細化します。**まず10秒程度・`--jobs 1`で試してください。** 超解像はNVENCとは別のGPU処理で、通常エンコードより時間と一時ディスク容量を消費します。
+
+初回だけ公式のWindowsポータブル版とモデルをセットアップします。Pythonの追加パッケージは不要です。Vulkan対応GPU・ドライバーが必要です。
+
+```powershell
+.\Setup-RealESRGAN.ps1
+```
+
+このスクリプトは [公式配布のWindows版](https://github.com/xinntao/Real-ESRGAN/releases/tag/v0.2.5.0) を `tools\realesrgan` へダウンロードし、固定SHA-256で検証して展開します。既に実行ファイルがあれば変更しません。ツール・モデルはGit管理対象外です。この環境ではセットアップ・実機テスト済みです。
+
+アニメ向けモデルで2倍の超解像を行い、最終出力を4Kにする例です。
+
+```powershell
+py -3 .\encode.py encode 'D:\Recordings\番組.ts' --super-resolution --sr-model realesr-animevideov3 --sr-scale 2 --resize 3840x2160 --start 300 --duration 10 --output-dir '.\samples\sr-anime-4k' --jobs 1 --verify-full --keep-awake
+```
+
+実写・一般映像向けの例です。
+
+```powershell
+py -3 .\encode.py encode 'D:\Recordings\番組.ts' --super-resolution --sr-model realesrgan-x4plus --sr-scale 4 --resize 3840x2160 --start 300 --duration 10 --output-dir '.\samples\sr-general-4k' --jobs 1 --verify-full --keep-awake
+```
+
+映像に応じてモデルを選んでください。AIが推定した細部が追加されるため、文字の変形、ちらつき、肌や線の質感の変化がないか比較してください。顔の専用補正やフレーム補間は行いません。対応モデルと引数は [Real-ESRGAN ncnn Vulkan公式説明](https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan) も参照してください。
+
+| オプション | 内容 |
+|---|---|
+| `--super-resolution` | 超解像を有効化。省略時は従来どおり |
+| `--sr-model` | 既定 `realesrgan-x4plus`（一般向け）。`realesrgan-x4plus-anime`（アニメ画像向け）、`realesr-animevideov3`（アニメ動画向け）も同梱。`realesrnet-x4plus`は対応モデルを別途用意した場合に選択可能 |
+| `--sr-scale` | 既定4。`realesr-animevideov3`は2/3/4、他のモデルは4のみ |
+| `--sr-exe` | 実行ファイル。既定 `tools\realesrgan\realesrgan-ncnn-vulkan.exe` |
+| `--sr-model-dir` | モデルのフォルダー。既定は実行ファイル横の `models` |
+| `--sr-gpu` | VulkanのGPU番号。省略時はツールが自動選択。ログにGPU一覧が出ます。この環境での試験時は0=RTX 5080、1=内蔵Radeonでした |
+| `--sr-tile` | 既定128。32以上または0（自動）。VRAM不足時は64など小さくして試す |
+| `--sr-work-dir` | 一時作業フォルダーの親。既定は各MP4の出力先。空き容量が多いSSDなどを指定可能 |
+
+処理順は **選択サービスのデコード・必要なインターレース解除 → SARを考慮して正方形ピクセル化 → Real-ESRGAN → 任意の`--resize`で最終サイズ・黒帯調整 → HEVC/AACのMP4** です。1440×1080・SAR 4:3なら、1920×1080へ正方形ピクセル化してから2倍モデルで3840×2160になります。4倍モデルなら一度7680×4320になるため、4K指定時はその後で縮小します。
+
+`--resize` を省略するとモデルの倍率どおりの出力サイズになります。8bit HEVC用プロファイル（既定NVENC、`hevc-amf`、`hevc-balanced`など）で使用できます。H.264や10bitプロファイルはエラーにします。字幕・データ放送は従来どおり出力しません。テレシネの24p復元は別途必要で、このオプションでは追加しません。
+
+**初期実装は区間全体の可逆FFV1中間動画と、処理前・処理後のPNG連番を一時保存します。** 数十分～数時間の4K化では空き容量が数十～数百GB以上必要になることがあります。必要量は映像・倍率・長さに依存し、タイルサイズを小さくしてもディスク使用量は減りません。並列実行ではこの使用量とVRAM負荷も増えます。必要なら `--sr-work-dir 'E:\SR-Temp'` を指定してください。通常終了・処理失敗・Ctrl+C時は、この実行用の `.sr-*` 一時フォルダーを削除します。強制終了・電源断では残る場合があります。
+
+デインターレース後のフレーム時刻を記録して連番を再構成し、完成品の全フレーム数と時刻を検査します。中間動画のミリ秒単位の時刻と再構成時の丸め差は2msまで許容し、それ以上のずれやフレーム欠落があれば完成MP4として公開しません。音声は同じ中間動画から取り出してAACに変換し、元の言語・タイトル情報を引き継ぎます。モデル・実行ファイルのSHA-256と各設定を完成記録に含めるため、通常版や別モデルの出力を誤ってスキップしません。既存MP4は上書きしないので、試験時は別出力先を使ってください。`encode_seconds` には超解像の前処理・推論・最終エンコードを含みます。
+
+PowerShellラッパーでも指定できます。本番バッチの前に、上記のPythonコマンドで短い区間を比較してください。
+
+```powershell
+.\Run-Queue.ps1 -InputDirectory 'D:\Recordings\Completed' -OutputDirectory 'D:\Encoded-SR' -SuperResolution -SrModel realesr-animevideov3 -SrScale 2 -Resize 3840x2160 -Jobs 1 -VerifyFull -KeepAwake
+```
+
+ラッパーでは追加で `-SrExe`、`-SrWorkDirectory`、`-SrGpu` も指定できます。`--dry-run` はモデル・実行ファイルと入力を確認して処理予定を表示しますが、中間ファイル生成や推論は実行しません。
+
 ## AMD Radeon / Ryzen内蔵GPUでエンコードする
 
 AMDのAMFに対応するGPU・ドライバーと `hevc_amf` を含むFFmpegを使用します。Ryzen 9 9950X（Granite Ridge）の内蔵Radeonで動作確認しています。内蔵GPUをBIOSで有効にし、AMDのグラフィックスドライバーをインストールしてください。エンコーダーが利用できない場合は失敗として記録し、別のエンコーダーへ自動切替はしません。
@@ -274,6 +327,8 @@ py -3 .\encode.py encode 'D:\Recordings\番組.ts' --output-dir 'D:\Encoded-Reco
 入力フォルダーには録画完了ファイルだけを置きます。サービス ID が異なる録画が混在する場合は録画側で目的サービスを抽出するか、サービス別にキューを分け、`-ProgramId` と別の出力フォルダーを設定します。実行ポリシーで `.ps1` が制限される環境では、その環境の方針に従うか、Python に `encode.py encode ...` を直接渡してください。タスクの登録はこのリポジトリーでは自動実行しません。
 
 ## 検証
+
+Real-ESRGANをセットアップした実機では `py -3 .\tests\smoke_super_resolution.py` で超解像も検査できます。この試験はRTX 5080・AMD AMFが必要です。人工TSでアニメ動画モデル2倍→4K、一般モデル4倍→AMF、可変フレームレートのbob→x265を処理し、音声2トラック・言語・時刻・全体デコード・再開・中間ファイル削除・黒画面でないことを確認します。2026-10-24、FFmpeg 9.0.2で成功しました。生成物と `report.json` は `samples/superres-*` に保存します。人工素材による短区間の機能試験で、実番組の画質・速度・長時間の音声同期を保証するものではありません。
 
 ```powershell
 py -3 -m unittest discover -s tests -v

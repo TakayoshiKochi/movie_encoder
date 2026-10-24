@@ -12,6 +12,12 @@ param(
     [switch]$DryRun,
     [switch]$VerifyFull,
     [switch]$KeepAwake,
+    [switch]$SuperResolution,
+    [string]$SrModel = 'realesrgan-x4plus',
+    [ValidateSet(2, 3, 4)][int]$SrScale = 4,
+    [string]$SrExe,
+    [string]$SrWorkDirectory,
+    [int]$SrGpu = -1,
     [switch]$AllowInputErrors
 )
 $ErrorActionPreference = 'Stop'
@@ -29,6 +35,12 @@ if ($ProgramId -ge 0) { $cliArgs += @('--program', "$ProgramId") }
 if ($DryRun) { $cliArgs += '--dry-run' }
 if ($VerifyFull) { $cliArgs += '--verify-full' }
 if ($KeepAwake) { $cliArgs += '--keep-awake' }
+if ($SuperResolution) {
+    $cliArgs += @('--super-resolution', '--sr-model', $SrModel, '--sr-scale', "$SrScale")
+    if ($SrExe) { $cliArgs += @('--sr-exe', $SrExe) }
+    if ($SrWorkDirectory) { $cliArgs += @('--sr-work-dir', $SrWorkDirectory) }
+    if ($SrGpu -ge 0) { $cliArgs += @('--sr-gpu', "$SrGpu") }
+}
 if ($AllowInputErrors) { $cliArgs += '--allow-input-errors' }
 if ($Resize) { $cliArgs += @('--resize', $Resize) }
 & $runner.Source @cliArgs

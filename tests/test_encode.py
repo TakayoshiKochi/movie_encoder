@@ -1,7 +1,7 @@
 import argparse
 import copy
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 import io
 import json
@@ -341,6 +341,47 @@ class EncodingTests(unittest.TestCase):
             encode.write_json(config, {"test": {**cfg, **change}})
             with self.subTest(change=change), self.assertRaises(ValueError):
                 encode.load_profile(config, "test")
+
+    def test_super_resolution_record_and_resume_match_model(self):
+        self.cfg = encode.load_profile(encode.ROOT / "profiles.json", "hevc-nvenc")
+        self.args.resize = (1280, 720)
+        self.args.sr_options = {"model": "realesr-animevideov3", "scale": 2, "model_sha256": "original"}
+        output = self.hevc_output()
+        output["streams"][0].update(width=1280, height=720, sample_aspect_ratio="1:1")
+        def final(command, ffmpeg, target, *args):
+            return [ffmpeg, str(target)]
+        with patch("encode.super_resolution.prepare", return_value=nullcontext({"frames": 10})) as prepare, \
+             patch("encode.super_resolution.final_command", side_effect=final), \
+             patch("encode.super_resolution.verify_timing") as verify:
+            self.assertEqual(self.run_job(probe=[INFO, output]), "encoded")
+            self.assertEqual(self.run_job(probe=[INFO, output]), "skipped")
+            prepare.assert_called_once()
+            verify.assert_called_once()
+        record = encode.read_json(self.target.with_suffix(".mp4.json"))
+        self.assertEqual(record["super_resolution"], {"frames": 10, "timing_verified": True})
+        self.args.sr_options["model_sha256"] = "updated"
+        with self.assertRaisesRegex(ValueError, "no matching job record"):
+            self.run_job(probe=[INFO])
+
+    def test_super_resolution_failure_does_not_publish(self):
+        self.cfg = encode.load_profile(encode.ROOT / "profiles.json", "hevc-nvenc")
+        self.args.resize = (1280, 720)
+        self.args.sr_options = {"model": "realesr-animevideov3", "scale": 2}
+        with patch("encode.super_resolution.prepare", side_effect=ValueError("model failed")), \
+             self.assertRaisesRegex(ValueError, "model failed"):
+            self.run_job(probe=[INFO])
+        self.assertFalse(self.target.exists())
+        self.assertEqual(list(self.target.parent.glob("*.partial.mp4")), [])
+
+    def test_super_resolution_dry_run_does_not_generate_frames(self):
+        self.cfg = encode.load_profile(encode.ROOT / "profiles.json", "hevc-nvenc")
+        self.args.resize = (1280, 720)
+        self.args.sr_options = {"model": "realesr-animevideov3", "scale": 2}
+        self.args.dry_run = True
+        with patch("encode.super_resolution.prepare") as prepare:
+            self.assertEqual(self.run_job(probe=[INFO]), "planned")
+            prepare.assert_not_called()
+        self.assertFalse(self.target.parent.exists())
 
     def test_crf_and_cq_cannot_be_mixed(self):
         for profile, kwargs in (("hevc-nvenc", {"crf": 22}), ("hevc-balanced", {"cq": 22})):
