@@ -51,7 +51,7 @@ def configure(args, cfg, executable):
     return {"exe": str(tool), "exe_sha256": digest(tool), "model_dir": str(models),
             "model": args.sr_model, "scale": args.sr_scale,
             "model_sha256": {p.name: digest(p) for p in files}, "tile": args.sr_tile, "gpu": args.sr_gpu,
-            "pipeline_version": 1}
+            "pipeline_version": 2}
 
 
 def frame_timeline(frames, fallback_rate):
@@ -120,7 +120,9 @@ def prepare(source, args, cfg, video, audios, ffmpeg, ffprobe, options, *,
         filters += ["scale=w='max(2,trunc(iw*if(gt(sar,0),sar,1)/2)*2)':h=ih", "setsar=1"]
         cmd += ["-map_metadata", "-1", "-sn", "-dn", "-vf", ",".join(filters),
                 "-c:v", "ffv1", "-level", "3", "-pix_fmt", "yuv420p", "-fps_mode", "vfr",
-                "-c:a", "copy", "-f", "matroska", str(intermediate)]
+                # Apply source error recovery before inference; damaged AAC must
+                # not be copied into the strict final encoding stage.
+                "-c:a", "pcm_s24le", "-f", "matroska", str(intermediate)]
         run(cmd, "decode/deinterlace and normalize SAR")
         info = probe(ffprobe, intermediate, runner=runner)
         streams = info["streams"]

@@ -105,6 +105,23 @@ class SuperResolutionTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("-itsoffset") + 1], "0.021")
         self.assertNotIn("-r", cmd)
         self.assertIn("pad=3840:2160", " ".join(cmd))
+        self.assertIn("-xerror", cmd)
+
+    def test_source_audio_is_decoded_under_input_error_policy(self):
+        for allow in (False, True):
+            self.args.allow_input_errors = allow
+            captured = []
+            def stop(cmd, **kwargs):
+                captured.append(cmd)
+                raise subprocess.CalledProcessError(1, cmd)
+            with self.subTest(allow=allow), self.assertRaises(subprocess.CalledProcessError):
+                with sr.prepare(self.root / "input.ts", self.args, self.cfg, {"index": 6}, [{"index": 5}],
+                                "ffmpeg", "ffprobe", {}, runner=stop, probe=None,
+                                status=lambda *a, **kw: None, log=io.StringIO(), workspace_parent=self.root):
+                    self.fail("processing should stop at the first command")
+            cmd = captured[0]
+            self.assertEqual(cmd[cmd.index("-c:a") + 1], "pcm_s24le")
+            self.assertEqual("-xerror" in cmd, not allow)
 
     def test_timing_verification_rejects_loss_or_shift(self):
         prepared = {"frames": 2, "times": [Decimal("0.021"), Decimal("0.054")]}
